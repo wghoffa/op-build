@@ -1,0 +1,534 @@
+From b3bf3ed5689b2c91e32c3bd714d9ea23fdbab452 Mon Sep 17 00:00:00 2001
+From: Bill Hoffa <wghoffa@us.ibm.com>
+Date: Wed, 11 Mar 2015 08:40:08 -0500
+Subject: [PATCH] Update FRU Inventory Field data for updated Habanero VPD
+
+Change-Id: I7cf6d803bcc7c30e2069844ec5af25b00611b259
+---
+ src/include/usr/vpd/mvpdenums.H |   1 +
+ src/usr/ipmi/ipmifruinv.C       | 307 ++++++++++++++++++++++++++++++++--------
+ src/usr/ipmi/ipmifruinvprvt.H   |  53 ++++++-
+ src/usr/vpd/mvpd.H              |   1 +
+ 4 files changed, 302 insertions(+), 60 deletions(-)
+
+diff --git a/src/include/usr/vpd/mvpdenums.H b/src/include/usr/vpd/mvpdenums.H
+index 950245f..fd4ddaf 100644
+--- a/src/include/usr/vpd/mvpdenums.H
++++ b/src/include/usr/vpd/mvpdenums.H
+@@ -79,6 +79,7 @@ enum mvpdRecord
+     LWPE        = 0x20,
+     VWML        = 0x21,
+     MER0        = 0x22,
++    VRML        = 0x23,
+ 
+     // Last Record
+     MVPD_LAST_RECORD,
+diff --git a/src/usr/ipmi/ipmifruinv.C b/src/usr/ipmi/ipmifruinv.C
+index 7c9eb85..4687727 100644
+--- a/src/usr/ipmi/ipmifruinv.C
++++ b/src/usr/ipmi/ipmifruinv.C
+@@ -35,6 +35,9 @@
+ #include <ipmi/ipmifruinv.H>
+ #include "ipmifru.H"
+ #include "ipmifruinvprvt.H"
++#include <console/consoleif.H>
++#include <stdio.h>
++#include <pnor/pnorif.H>
+ 
+ extern trace_desc_t * g_trac_ipmi;
+ 
+@@ -82,6 +85,10 @@ IpmiFruInv *IpmiFruInv::Factory(TARGETING::TargetHandleList i_targets,
+             // @todo-RTC:117702
+             l_fru = new backplaneIpmiFruInv(l_target, i_targets, i_updateData);
+             break;
++        case TARGETING::TYPE_SYS:
++            // Use sys target for setting System Firmware Info
++            l_fru = new systemFwIpmiFruInv(l_target);
++            break;
+         default:
+             assert(false,
+                 "IpmiFruInv::Factory: No support for target type given: [%08x]",
+@@ -115,6 +122,7 @@ void IpmiFruInv::printRecordDebugData(const std::vector<uint8_t> &i_data)
+ {
+     if (i_data.size() > 0)
+     {
++        TRACFCOMP(g_trac_ipmi,"IpmiRecordData is size: %08x", i_data.size());
+         TRACFBIN(g_trac_ipmi, "IpmiRecordData", &i_data[0], i_data.size());
+     }
+     else
+@@ -401,7 +409,7 @@ errlHndl_t isdimmIpmiFruInv::buildProductInfoArea(std::vector<uint8_t> &io_data)
+         l_errl = addVpdData(io_data, SPD::BASIC_MEMORY_TYPE);
+         if (l_errl) { break; }
+         //Set Product Part/Model Number
+-        l_errl = addVpdData(io_data, SPD::MODULE_PART_NUMBER);
++        l_errl = addVpdData(io_data, SPD::MODULE_PART_NUMBER, true);
+         if (l_errl) { break; }
+         //Set Product Version
+         l_errl = addVpdData(io_data, SPD::MODULE_REVISION_CODE);
+@@ -411,8 +419,7 @@ errlHndl_t isdimmIpmiFruInv::buildProductInfoArea(std::vector<uint8_t> &io_data)
+         if (l_errl) { break; }
+ 
+         //Add Asset Tag
+-        io_data.push_back(uint8_t(1)); //Asset Tag is One Byte for now
+-        io_data.push_back(uint8_t(0));
++        io_data.push_back(uint8_t(0)); //No Asset Tag needed - O bytes
+ 
+         //FRU File ID - Empty
+         io_data.push_back(IPMIFRUINV::TYPELENGTH_BYTE_NULL);
+@@ -434,7 +441,8 @@ errlHndl_t isdimmIpmiFruInv::buildProductInfoArea(std::vector<uint8_t> &io_data)
+ }
+ 
+ errlHndl_t isdimmIpmiFruInv::addVpdData(std::vector<uint8_t> &io_data,
+-                                     uint8_t i_keyword)
++                                     uint8_t i_keyword,
++                                     bool i_ascii)
+ {
+     size_t     l_vpdSize = 0;
+     errlHndl_t l_errl = NULL;
+@@ -463,11 +471,21 @@ errlHndl_t isdimmIpmiFruInv::addVpdData(std::vector<uint8_t> &io_data,
+             uint8_t l_offset = io_data.size();
+             io_data.resize(l_offset + 1 + l_vpdSize);
+ 
+-            //Add on the data to the type/length byte indicating it is binary
+-            io_data.at(l_offset) = l_vpdSize;
++            //Add on the data to the type/length byte indicating it is ascii
++            // otherwise leave it as binary
++            if (i_ascii)
++            {
++                io_data.at(l_offset) = l_vpdSize
++                                       + IPMIFRUINV::TYPELENGTH_BYTE_ASCII;
++            }
++            else
++            {
++                io_data.at(l_offset) = l_vpdSize;
++            }
++            l_offset += 1;
+ 
+             //Read the VPD data directly into fru inventory data buffer
+-            l_errl = deviceRead(iv_target,&io_data[l_offset+1], l_vpdSize,
++            l_errl = deviceRead(iv_target,&io_data[l_offset], l_vpdSize,
+                         DEVICE_SPD_ADDRESS(i_keyword));
+         }
+         else
+@@ -534,10 +552,10 @@ errlHndl_t procIpmiFruInv::buildBoardInfoArea(std::vector<uint8_t> &io_data)
+         l_errl = addVpdData(io_data, MVPD::VINI, MVPD::DR, true);
+         if (l_errl) { break; }
+         //Set Board Info serial number
+-        l_errl = addVpdData(io_data, MVPD::VINI, MVPD::SN);
++        l_errl = addVpdData(io_data, MVPD::VRML, MVPD::SN, true);
+         if (l_errl) { break; }
+         //Set Board part number
+-        l_errl = addVpdData(io_data, MVPD::VINI, MVPD::FN);
++        l_errl = addVpdData(io_data, MVPD::VRML, MVPD::PN, true);
+         if (l_errl) { break; }
+         //Set Board FRU File ID
+         l_errl = addVpdData(io_data, MVPD::VINI, MVPD::VZ);
+@@ -760,47 +778,18 @@ errlHndl_t backplaneIpmiFruInv::buildBoardInfoArea(
+ 
+         //Set Product Name - ascii formatted data
+         //@fixme RTC Story 118373
+-        l_errl = addVpdData(io_data, CVPD::OSYS, CVPD::DR, true);
+-
+-        //Support Legacy VPD without OSYS record
+-        if (l_errl)
+-        {
+-
+-            TRACFCOMP(g_trac_ipmi,
+-                      "backplaneIpmiFruInv::buildChassisBoardInfoArea - "
+-                      " Using Legacy Chassis VPD Data without OSYS record");
+-
+-            //Delete errorlog and use Legacy VPD Fields
+-            delete l_errl;
+-            l_errl = NULL;
+-            //Set Product Name - ascii formatted data
+-            //@fixme RTC Story 118373
+-            l_errl = addVpdData(io_data, CVPD::OPFR, CVPD::DR, true);
+-            if (l_errl) { break; }
+-
+-            //Set Product Serial number - ascii formatted data
+-            //@fixme RTC Story 118373
+-            l_errl = addVpdData(io_data, CVPD::OPFR, CVPD::VS, true);
+-            if (l_errl) { break; }
+-
+-            //Set Product Part number - ascii formatted data
+-            //@fixme RTC Story 118373
+-            l_errl = addVpdData(io_data, CVPD::OPFR, CVPD::VP, true);
+-            if (l_errl) { break; }
++        l_errl = addVpdData(io_data, CVPD::OPFR, CVPD::DR, true);
++        if (l_errl) { break; }
+ 
+-        }
+-        else
+-        {
+-            //Set serial number - ascii formatted field
+-            //@fixme RTC Story 118373
+-            l_errl = addVpdData(io_data, CVPD::OSYS, CVPD::SS, true);
+-            if (l_errl) { break; }
++        //Set Product Serial number - ascii formatted data
++        //@fixme RTC Story 118373
++        l_errl = addVpdData(io_data, CVPD::OPFR, CVPD::VS, true);
++        if (l_errl) { break; }
+ 
+-            //Set chassis part number - ascii formatted field
+-            //@fixme RTC Story 118373
+-            l_errl = addVpdData(io_data, CVPD::OSYS, CVPD::MM, true);
+-            if (l_errl) { break; }
+-        }
++        //Set Product Part number - ascii formatted data
++        //@fixme RTC Story 118373
++        l_errl = addVpdData(io_data, CVPD::OPFR, CVPD::VP, true);
++        if (l_errl) { break; }
+ 
+         //Push Fru File ID Byte - NULL
+         io_data.push_back(IPMIFRUINV::TYPELENGTH_BYTE_NULL);
+@@ -944,28 +933,224 @@ errlHndl_t backplaneIpmiFruInv::addVpdData(std::vector<uint8_t> &io_data,
+     return l_errl;
+ }
+ 
++//##############################################################################
++systemFwIpmiFruInv::systemFwIpmiFruInv( TARGETING::TargetHandle_t i_target )
++    :IpmiFruInv(i_target)
++{
++
++};
++
++errlHndl_t systemFwIpmiFruInv::buildInternalUseArea(std::vector<uint8_t>
++                                                                       &io_data)
++{
++    //This section not needed for proc type
++    return IpmiFruInv::buildEmptyArea(io_data);
++}
++
++errlHndl_t systemFwIpmiFruInv::buildChassisInfoArea(std::vector<uint8_t>
++                                                                       &io_data)
++{
++    //This section not needed for system firmware type
++    return IpmiFruInv::buildEmptyArea(io_data);
++}
++
++errlHndl_t systemFwIpmiFruInv::buildBoardInfoArea(std::vector<uint8_t> &io_data)
++{
++    //This section not needed for system firmware type
++    return IpmiFruInv::buildEmptyArea(io_data);
++}
++
++errlHndl_t systemFwIpmiFruInv::buildProductInfoArea(std::vector<uint8_t>
++                                                                       &io_data)
++{
++    errlHndl_t l_errl = NULL;
++
++    do {
++        //Set formatting data that goes at the beginning of the record
++        preFormatProcessing(io_data, true);
++
++        uint8_t l_data[] = {IPMIFRUINV::TYPELENGTH_BYTE_ASCII + 3,'I','B','M',
++                            IPMIFRUINV::TYPELENGTH_BYTE_ASCII + 18, 'O','p','e',
++                            'n','P','O','W','E','R',' ','F','i','r','m','w','a',
++                            'r','e', IPMIFRUINV::TYPELENGTH_BYTE_NULL};
++
++        io_data.insert( io_data.end(),
++                    &l_data[0],
++                    &l_data[0] + (uint8_t(sizeof(l_data) / sizeof(uint8_t))));
++
++        //Get PNOR Version Here
++        PNOR::SectionInfo_t l_pnorInfo;
++        l_errl = getSectionInfo( PNOR::VERSION , l_pnorInfo);
++        if (l_errl) { break; }
++
++        uint8_t* l_versionData = reinterpret_cast<uint8_t*>( l_pnorInfo.vaddr );
++        //Total Bytes in PNOR Version String
++        uint8_t l_numBytes = 0;
++        uint8_t l_curOffset = 0;
++
++        //Total Number of fields needed to print PNOR Version String
++        uint8_t l_numFields = 0;
++        bool l_clearStandardFields = true;
++
++        //First determine number of bytes in PNOR Version string
++        //  with the caveat there is a max record size allowed, so
++        //  the string will be cut off if too long
++        //Also, remove whitespace/newline chars
++        while ((l_numBytes < IPMIFRUINV::MAX_RECORD_SIZE -
++                              (uint8_t(sizeof(l_data) / sizeof(uint8_t))) -
++                              IPMIFRUINV::COMMON_HEADER_FORMAT_SIZE - 8)
++                               && (((char)(l_versionData[l_numBytes])) != '\0'))
++        {
++
++            //TRACFCOMP(g_trac_ipmi,"l_numBytes [%d], l_curOffset [%d]",
++            //                    l_numBytes, l_curOffset);
++
++            if (((char)(l_versionData[l_numBytes])) == '\n')
++            {
++
++                //TRACFCOMP(g_trac_ipmi,"newline found!");
++
++                if (l_numBytes > l_curOffset)
++                {
++
++                    //TRACFCOMP(g_trac_ipmi,"Inserting data!");
++
++                    //Add on size of this field to the data buffer
++                    io_data.push_back(
++                         IPMIFRUINV::TYPELENGTH_BYTE_ASCII
++                           + (l_numBytes-l_curOffset));
++
++                    io_data.insert(io_data.end(),
++                       &l_versionData[0]+(l_curOffset),
++                       &l_versionData[0]+(l_numBytes));
++                }
++
++                //Null data for standard fields needs to be indicated once after
++                // the first segment of data is displayed to match the
++                // ipmi fru spec
++                if (l_clearStandardFields)
++                {
++                    //Add Empty Asset Tag
++                    io_data.push_back(uint8_t(0));
++                    //FRU File ID - Empty
++                    io_data.push_back(IPMIFRUINV::TYPELENGTH_BYTE_NULL);
++                    io_data.push_back(uint8_t(0)); // Empty FRU File ID bytes
++                    l_clearStandardFields = false;
++                }
++
++                //Increment past the newline char
++                l_curOffset = l_numBytes + 1;
++            }
++            l_numBytes++;
++        }
++
++        if (l_curOffset == 0)
++        {
++            //Calculate the number of fields required to display this data
++            //  given only MAX_ASCII_FIELD_SIZE bytes can be in any one given
++            //  IPMI fru inventory field
++            l_numFields = l_numBytes / IPMIFRUINV::MAX_ASCII_FIELD_SIZE;
++            if (l_numBytes % IPMIFRUINV::MAX_ASCII_FIELD_SIZE)
++            {
++                l_numFields += 1;
++            }
++
++            //Count by number of fields, adding the data to the buffer as
++            // we go.
++            for (uint8_t i=0; i < l_numFields; i++)
++            {
++                //Determine the data size for this particular field
++                uint8_t l_dataSize=IPMIFRUINV::MAX_ASCII_FIELD_SIZE;
++                if (i == l_numFields - 1)
++                {
++                    l_dataSize = l_numBytes -
++                           (i * IPMIFRUINV::MAX_ASCII_FIELD_SIZE);
++                }
++
++                //Add on size of this field to the data buffer
++                io_data.push_back(IPMIFRUINV::TYPELENGTH_BYTE_ASCII
++                                         + l_dataSize);
++
++                //Insert this segment of version string data
++                io_data.insert(io_data.end(),
++                       &l_versionData[0]+(i * IPMIFRUINV::MAX_ASCII_FIELD_SIZE),
++                       &l_versionData[0]+(i * IPMIFRUINV::MAX_ASCII_FIELD_SIZE)
++                                        +l_dataSize);
++
++                //Null data for standard fields needs to be indicated once after
++                // the first segment of data is displayed to match the
++                // ipmi fru spec
++                if (l_clearStandardFields)
++                {
++                    //Add Empty Asset Tag
++                    io_data.push_back(uint8_t(0));
++                    //FRU File ID - Empty
++                    io_data.push_back(IPMIFRUINV::TYPELENGTH_BYTE_NULL);
++                    //io_data.push_back(uint8_t(0)); // Empty FRU File ID bytes
++                    l_clearStandardFields = false;
++                }
++
++            }
++        }
++        else
++        {
++            if (l_numBytes > l_curOffset)
++            {
++                io_data.push_back( IPMIFRUINV::TYPELENGTH_BYTE_ASCII
++                        + (l_numBytes-l_curOffset));
++
++                io_data.insert(io_data.end(),
++                       &l_versionData[0]+(l_curOffset),
++                       &l_versionData[0]+(l_numBytes));
++            }
++
++        }
++
++        if (l_clearStandardFields)
++        {
++            //Add Asset Tag
++            io_data.push_back(uint8_t(0)); //No Asset Tag needed - O bytes
++            //FRU File ID - Empty
++            io_data.push_back(IPMIFRUINV::TYPELENGTH_BYTE_NULL);
++            //io_data.push_back(uint8_t(0)); // Empty FRU File ID bytes
++        }
++
++        io_data.push_back(IPMIFRUINV::END_OF_CUSTOM_FIELDS);
++
++        //Finalize section formatting
++        postFormatProcessing(io_data);
++
++    } while(0);
++
++    return l_errl;
++}
++
++errlHndl_t systemFwIpmiFruInv::buildMultiRecordInfoArea(std::vector<uint8_t>
++                                                                       &io_data)
++{
++    //This section not needed for system firmware type
++    return IpmiFruInv::buildEmptyArea(io_data);
++}
++
+ void IpmiFruInv::addEcidData(const TARGETING::TargetHandle_t& i_target,
+                              const TARGETING::ATTR_ECID_type& i_ecidInfo,
+                              std::vector<uint8_t> &io_data)
+ {
+     // Create Custom ECID Field
+     // - First put in 'ECID:' to make it obvious what this is
+-    uint8_t l_data[] = {IPMIFRUINV::TYPELENGTH_BYTE_ASCII + 5,'E','C','I','D',
+-                                   ':', IPMIFRUINV::TYPELENGTH_BYTE_NULL + 16};
++    uint8_t l_data[] = {IPMIFRUINV::TYPELENGTH_BYTE_ASCII + 21,'E','C','I','D',
++                                    ':'};
+ 
+     // @todo-RTC:124687 - Refactor multiple reallocations
+     io_data.insert( io_data.end(),
+                     &l_data[0],
+                     &l_data[0] + (uint8_t(sizeof(l_data) / sizeof(uint8_t))));
+ 
+-    uint8_t* l_vDataPtr = (uint8_t*) &i_ecidInfo[0];
+-    //Insert first 64 bits of ECID data
+-    io_data.insert(io_data.end(),
+-                &l_vDataPtr[0], &l_vDataPtr[0]+8);
+-    l_vDataPtr = (uint8_t*) &i_ecidInfo[1];
+-    //Insert second 64 bits of ECID data
+-    io_data.insert(io_data.end(),
+-        &l_vDataPtr[0], &l_vDataPtr[0]+8);
++    char l_ecidAscii[33];
++    sprintf(l_ecidAscii, "%.16llX%.16llX", i_ecidInfo[0], i_ecidInfo[1]);
++
++    uint8_t* l_vDataPtr = (uint8_t*) &l_ecidAscii[0];
++    io_data.insert(io_data.end(), &l_vDataPtr[0], &l_vDataPtr[0]+16);
+ 
+     return;
+ }
+@@ -1014,10 +1199,15 @@ void IPMIFRUINV::setData(bool i_updateData)
+             IPMIFRUINV::gatherClearData(pSys, frusToClear);
+         }
+ 
++        //wh_todo - quick fix for softlayer to show System Firmware Version
++        uint32_t PNOR_VERSION_FRU_ID = 42;
++        l_potentialFrus.push_back(std::make_pair(pSys, PNOR_VERSION_FRU_ID));
++
+         // Find list of all target types that may need a fru inv. record set
+         IPMIFRUINV::gatherSetData(pSys, frusToClear,
+                                      l_potentialFrus, i_updateData);
+ 
++
+         //Now Loop through all TargetHandle_t, uint8_t pairs to see if there are
+         //multiple targets with the same fruId. These will be formed into a list
+         //as data from all Targets will be combined into one IPMI Fru Inventory
+@@ -1066,6 +1256,7 @@ void IPMIFRUINV::setData(bool i_updateData)
+                          l_fruId, l_curFru.size());
+                 l_fru->sendFruData(l_fruId);
+                 delete l_fru;
++
+             }
+         }
+ 
+diff --git a/src/usr/ipmi/ipmifruinvprvt.H b/src/usr/ipmi/ipmifruinvprvt.H
+index aed5dfc..468a47f 100644
+--- a/src/usr/ipmi/ipmifruinvprvt.H
++++ b/src/usr/ipmi/ipmifruinvprvt.H
+@@ -42,6 +42,8 @@ namespace IPMIFRUINV
+         COMMON_HEADER_FORMAT_SIZE     = 8, //size in bytes
+         DEFAULT_CHASSIS_TYPE          = 0x05,
+         DEFAULT_FRU_OFFSET            = 0,
++        MAX_ASCII_FIELD_SIZE          = 0x3F, //size in bytes
++        MAX_RECORD_SIZE               = 0xFF, //size in bytes
+     };
+ };
+ 
+@@ -303,9 +305,11 @@ class isdimmIpmiFruInv : public IpmiFruInv
+      *        record
+      * @param[in/out] data, The container with record data
+      * @param[in] keyword, Indicates where in the VPD to get more data
+-
++     * @param[in] ascii, Indicates if VPD field is in ascii format or not
+      */
+-    errlHndl_t addVpdData(std::vector<uint8_t> &io_data, uint8_t i_keyword);
++    errlHndl_t addVpdData(std::vector<uint8_t> &io_data,
++                          uint8_t i_keyword,
++                          bool i_ascii=false);
+ 
+ };
+ 
+@@ -458,4 +462,49 @@ class backplaneIpmiFruInv : public IpmiFruInv
+ 
+ };
+ 
++//Child class for building up System Firwmare Fru Inventory Record Data
++class systemFwIpmiFruInv : public IpmiFruInv
++{
++
++  public:
++    /**
++    * @brief Constructor
++    *
++    * @param[in] TargetHandle_t, Handle to target for which
++    *             to get relevant IPMI FRU Data from
++    */
++    systemFwIpmiFruInv( TARGETING::TargetHandle_t i_target);
++
++    /**
++     * @brief Builds the Internal Use Area Data Section
++     * @param[in/out] data, The container to put internal use area data in
++     */
++    errlHndl_t buildInternalUseArea(std::vector<uint8_t> &io_data);
++
++    /**
++     * @brief Builds the Chassis Info Area Data Section
++     * @param[in/out] data, The container to put chassis info area data in
++     */
++    errlHndl_t buildChassisInfoArea(std::vector<uint8_t> &io_data);
++
++    /**
++     * @brief Builds the Board Info Area Data Section
++     * @param[in/out] data, The container to put board info area data in
++     */
++    errlHndl_t buildBoardInfoArea(std::vector<uint8_t> &io_data);
++
++    /**
++     * @brief Builds the Product Info Area Data Section
++     * @param[in/out] data, The container to put product info area data in
++     */
++    errlHndl_t buildProductInfoArea(std::vector<uint8_t> &io_data);
++
++    /**
++     * @brief Builds the MultiRecord Info Area Data Section
++     * @param[in/out] data, The container to put multirecord info area data in
++     */
++    errlHndl_t buildMultiRecordInfoArea(std::vector<uint8_t> &io_data);
++
++};
++
+ #endif
+diff --git a/src/usr/vpd/mvpd.H b/src/usr/vpd/mvpd.H
+index 60a8491..e9fe905 100644
+--- a/src/usr/vpd/mvpd.H
++++ b/src/usr/vpd/mvpd.H
+@@ -88,6 +88,7 @@ namespace MVPD
+         { LWPE, "LWPE" },
+         { VWML, "VWML" },
+         { MER0, "MER0" },
++        { VRML, "VRML" },
+         // -------------------------------------------------------------------
+         // DO NOT USE!!  This is for test purposes ONLY!
+         { MVPD_TEST_RECORD, "TEST" },
+-- 
+1.8.2.2
+

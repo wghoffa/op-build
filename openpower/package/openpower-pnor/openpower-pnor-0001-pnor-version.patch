@@ -1,0 +1,162 @@
+From 6e4472bb1049de64ca0a2c3926609d2db08ce016 Mon Sep 17 00:00:00 2001
+From: Stephen Cprek <smcprek@us.ibm.com>
+Date: Wed, 18 Feb 2015 17:54:46 -0600
+Subject: [PATCH] Add PNOR version sections to all layouts
+
+---
+ create_pnor_image.pl                   |    6 ++++++
+ defaultPnorLayoutSingleSide.xml        |    7 +++++++
+ defaultPnorLayoutWithGoldenSide.xml    |   14 ++++++++++++++
+ defaultPnorLayoutWithoutGoldenSide.xml |   14 ++++++++++++++
+ update_image.pl                        |   10 ++++++++++
+ 5 files changed, 51 insertions(+), 0 deletions(-)
+
+diff --git a/create_pnor_image.pl b/create_pnor_image.pl
+index 45849af..8f5d39e 100755
+--- a/create_pnor_image.pl
++++ b/create_pnor_image.pl
+@@ -15,6 +15,7 @@ my $targeting_binary_filename = "";
+ my $sbec_binary_filename = "";
+ my $sbe_binary_filename = "";
+ my $occ_binary_filename = "";
++my $openpower_version_filename = "";
+ 
+ while (@ARGV > 0){
+     $_ = $ARGV[0];
+@@ -69,6 +70,10 @@ while (@ARGV > 0){
+         $occ_binary_filename = $ARGV[1] or die "Bad command line arg given: expecting an occ binary filename.\n";
+         shift;
+     }
++    elsif (/^-openpower_version_filename/i){
++        $openpower_version_filename = $ARGV[1] or die "Bad command line arg given: expecting openpower version filename.\n";
++        shift;
++    }
+     else {
+         print "Unrecognized command line arg: $_ \n";
+         print "To view all the options and help text run \'$program_name -h\' \n";
+@@ -105,6 +110,7 @@ $build_pnor_command .= " --binFile_ATTR_PERM $scratch_dir/attr_perm.bin.ecc";
+ $build_pnor_command .= " --binFile_OCC $occ_binary_filename.ecc";
+ $build_pnor_command .= " --binFile_FIRDATA $scratch_dir/firdata.bin.ecc";
+ $build_pnor_command .= " --binFile_CAPP $scratch_dir/capp.bin.ecc";
++$build_pnor_command .= " --binFile_VERSION $openpower_version_filename";
+ $build_pnor_command .= " --fpartCmd \"fpart\"";
+ $build_pnor_command .= " --fcpCmd \"fcp\"";
+ print "###############################";
+diff --git a/defaultPnorLayoutSingleSide.xml b/defaultPnorLayoutSingleSide.xml
+index bc104a8..81014bd 100755
+--- a/defaultPnorLayoutSingleSide.xml
++++ b/defaultPnorLayoutSingleSide.xml
+@@ -224,4 +224,11 @@ Layout Description
+         <sha512Version/>
+         <ecc/>
+     </section>
++    <section>
++        <description>PNOR Version (4K)</description>
++        <eyeCatch>VERSION</eyeCatch>
++        <physicalOffset>0x1FF7000</physicalOffset>
++        <physicalRegionSize>0x1000</physicalRegionSize>
++        <side>A</side>
++    </section>
+ </pnor>
+diff --git a/defaultPnorLayoutWithGoldenSide.xml b/defaultPnorLayoutWithGoldenSide.xml
+index f4e56a9..6f643e8 100755
+--- a/defaultPnorLayoutWithGoldenSide.xml
++++ b/defaultPnorLayoutWithGoldenSide.xml
+@@ -255,6 +255,13 @@ Layout Description
+         <side>A</side>
+         <ecc/>
+     </section>
++    <section>
++        <description>PNOR Version (4K)</description>
++        <eyeCatch>VERSION</eyeCatch>
++        <physicalOffset>0x1FF7000</physicalOffset>
++        <physicalRegionSize>0x1000</physicalRegionSize>
++        <side>A</side>
++    </section>
+     <!-- Golden Side (Side B) -->
+     <section>
+         <description>Hostboot Data (0.375M)</description>
+@@ -354,4 +361,11 @@ Layout Description
+         <readOnly/>
+         <ecc/>
+     </section>
++    <section>
++        <description>PNOR Version (4K)</description>
++        <eyeCatch>VERSION</eyeCatch>
++        <physicalOffset>0x3FF7000</physicalOffset>
++        <physicalRegionSize>0x1000</physicalRegionSize>
++        <side>B</side>
++    </section>
+ </pnor>
+diff --git a/defaultPnorLayoutWithoutGoldenSide.xml b/defaultPnorLayoutWithoutGoldenSide.xml
+index 63c0885..af129ff 100755
+--- a/defaultPnorLayoutWithoutGoldenSide.xml
++++ b/defaultPnorLayoutWithoutGoldenSide.xml
+@@ -254,6 +254,13 @@ Layout Description
+         <side>A</side>
+         <ecc/>
+     </section>
++    <section>
++        <description>PNOR Version (4K)</description>
++        <eyeCatch>VERSION</eyeCatch>
++        <physicalOffset>0x1FF7000</physicalOffset>
++        <physicalRegionSize>0x1000</physicalRegionSize>
++        <side>A</side>
++    </section>
+     <!-- Golden Side (Side B) -->
+     <section>
+         <description>Hostboot Data (0.375M)</description>
+@@ -343,4 +350,11 @@ Layout Description
+         <side>B</side>
+         <ecc/>
+     </section>
++    <section>
++        <description>PNOR Version (4K)</description>
++        <eyeCatch>VERSION</eyeCatch>
++        <physicalOffset>0x3FF7000</physicalOffset>
++        <physicalRegionSize>0x1000</physicalRegionSize>
++        <side>B</side>
++    </section>
+ </pnor>
+diff --git a/update_image.pl b/update_image.pl
+index f0f34e4..a259bab 100755
+--- a/update_image.pl
++++ b/update_image.pl
+@@ -14,6 +14,7 @@ my $targeting_binary_source = "";
+ my $sbe_binary_filename = "";
+ my $sbec_binary_filename = "";
+ my $occ_binary_filename = "";
++my $openpower_version_filename = "";
+ 
+ while (@ARGV > 0){
+     $_ = $ARGV[0];
+@@ -59,6 +60,10 @@ while (@ARGV > 0){
+         $occ_binary_filename = $ARGV[1] or die "Bad command line arg given: expecting a config type.\n";
+         shift;
+     }
++    elsif (/^-openpower_version_filename/i){
++        $openpower_version_filename = $ARGV[1] or die "Bad command line arg given: expecting a config type.\n";
++        shift;
++    }
+     else {
+         print "Unrecognized command line arg: $_ \n";
+         #print "To view all the options and help text run \'$program_name -h\' \n";
+@@ -141,10 +146,15 @@ run_command("ecc --inject $scratch_dir/hostboot.temp.bin --output $occ_binary_fi
+ run_command("dd if=/dev/zero bs=8K count=1 | tr \"\\000\" \"\\377\" > $scratch_dir/hostboot.temp.bin");
+ run_command("ecc --inject $scratch_dir/hostboot.temp.bin --output $scratch_dir/firdata.bin.ecc --p8");
+ 
++
+ #Create blank binary file for CAPP Partition
+ run_command("dd if=/dev/zero bs=38K count=1 | tr \"\\000\" \"\\377\" > $scratch_dir/hostboot.temp.bin");
+ run_command("ecc --inject $scratch_dir/hostboot.temp.bin --output $scratch_dir/capp.bin.ecc --p8");
+ 
++#Add openpower version file
++run_command("dd if=$openpower_version_filename of=$scratch_dir/openpower_version.temp ibs=4K conv=sync");
++run_command("cp $scratch_dir/openpower_version.temp $openpower_version_filename");
++
+ #Copy Binary Data files for consistency
+ run_command("cp $hb_binary_dir/$sbec_binary_filename $scratch_dir/");
+ run_command("cp $hb_binary_dir/$sbe_binary_filename $scratch_dir/");
+-- 
+1.7.4.1
+
