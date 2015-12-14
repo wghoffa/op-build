@@ -1,0 +1,33 @@
+From 0ca3224bfab13a85cf4788b86101b302778d073e Mon Sep 17 00:00:00 2001
+From: Bill Schwartz <whs@us.ibm.com>
+Date: Mon, 7 Dec 2015 09:48:35 -0600
+Subject: [PATCH] Fix ATTR_SPD_ADDR_MAP_REG_TO_DRAM size mismatch
+
+Shift 1 byte spd values to appropriate uint32_t position
+
+Change-Id: Ifee71a47c31e641ee46b434686c94d62add3c177
+RTC: 137707
+---
+ src/usr/hwpf/plat/fapiPlatAttributeService.C | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/usr/hwpf/plat/fapiPlatAttributeService.C b/src/usr/hwpf/plat/fapiPlatAttributeService.C
+index 82e7afd..ba43e74 100644
+--- a/src/usr/hwpf/plat/fapiPlatAttributeService.C
++++ b/src/usr/hwpf/plat/fapiPlatAttributeService.C
+@@ -303,6 +303,12 @@ fapi::ReturnCode fapiPlatGetSpdAttr(const fapi::Target * i_pFapiTarget,
+                 // Shift the data to be right aligned
+                 *(static_cast<uint32_t *>(o_data)) >>= 16;
+             }
++            else if ((i_len == sizeof(uint32_t)) && (l_len == sizeof(uint8_t)))
++            {
++                // This is a uint8_t attribute written to a uint32_t type.
++                // Shift the data to the lower byte
++                *(static_cast<uint32_t *>(o_data)) >>= 24;
++            }
+         }
+     }
+ 
+-- 
+1.8.2.2
+

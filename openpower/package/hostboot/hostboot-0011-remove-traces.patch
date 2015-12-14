@@ -1,0 +1,115 @@
+From 100d9f404fd35568cddca12a81d3d855ba8c3a9a Mon Sep 17 00:00:00 2001
+From: aalugore <aalugore@us.ibm.com>
+Date: Fri, 4 Dec 2015 10:37:18 -0600
+Subject: [PATCH] Remove traces to hasten IPL
+
+Change-Id: Ibf13ca7fd71c475274c0bae6c70b40dde92068da
+---
+ src/usr/hwpf/hwp/dimmBadDqBitmapAccessHwp.C    |  8 ++++----
+ src/usr/hwpf/hwp/dimmBadDqBitmapFuncs.C        | 14 ++++++++------
+ src/usr/hwpf/hwp/mvpd_accessors/getMBvpdAttr.C |  6 +++---
+ 3 files changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/src/usr/hwpf/hwp/dimmBadDqBitmapAccessHwp.C b/src/usr/hwpf/hwp/dimmBadDqBitmapAccessHwp.C
+index 98f9bf9..b2ff23e 100644
+--- a/src/usr/hwpf/hwp/dimmBadDqBitmapAccessHwp.C
++++ b/src/usr/hwpf/hwp/dimmBadDqBitmapAccessHwp.C
+@@ -764,11 +764,11 @@ fapi::ReturnCode dimmBadDqBitmapAccessHwp(
+ {
+     if (i_get)
+     {
+-        FAPI_INF(">>dimmBadDqBitmapAccessHwp: Getting bitmap");
++//        FAPI_INF(">>dimmBadDqBitmapAccessHwp: Getting bitmap");
+     }
+     else
+     {
+-        FAPI_INF(">>dimmBadDqBitmapAccessHwp: Setting bitmap");
++//        FAPI_INF(">>dimmBadDqBitmapAccessHwp: Setting bitmap");
+     }
+ 
+     fapi::ReturnCode l_rc;
+@@ -835,8 +835,8 @@ fapi::ReturnCode dimmBadDqBitmapAccessHwp(
+     }while(0);
+ 
+     delete [] &l_wiringData;
+-    FAPI_INF("<<dimmBadDqBitmapAccessHwp");
++//    FAPI_INF("<<dimmBadDqBitmapAccessHwp");
+     return l_rc;
+ }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/src/usr/hwpf/hwp/dimmBadDqBitmapFuncs.C b/src/usr/hwpf/hwp/dimmBadDqBitmapFuncs.C
+index 8f0efa1..9f595c5 100644
+--- a/src/usr/hwpf/hwp/dimmBadDqBitmapFuncs.C
++++ b/src/usr/hwpf/hwp/dimmBadDqBitmapFuncs.C
+@@ -5,7 +5,9 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* COPYRIGHT International Business Machines Corp. 2012,2014              */
++/* Contributors Listed Below - COPYRIGHT 2012,2015                        */
++/* [+] International Business Machines Corp.                              */
++/*                                                                        */
+ /*                                                                        */
+ /* Licensed under the Apache License, Version 2.0 (the "License");        */
+ /* you may not use this file except in compliance with the License.       */
+@@ -146,8 +148,8 @@ fapi::ReturnCode dimmGetBadDqBitmap(const fapi::Target & i_mba,
+                                     const uint8_t i_rank,
+                                     uint8_t (&o_data)[DIMM_DQ_RANK_BITMAP_SIZE])
+ {
+-    FAPI_INF(">>dimmGetBadDqBitmap. %s:%d:%d:%d", i_mba.toEcmdString(), i_port,
+-             i_dimm, i_rank);
++//    FAPI_INF(">>dimmGetBadDqBitmap. %s:%d:%d:%d", i_mba.toEcmdString(), i_port,
++//             i_dimm, i_rank);
+ 
+     fapi::ReturnCode l_rc;
+ 
+@@ -178,7 +180,7 @@ fapi::ReturnCode dimmGetBadDqBitmap(const fapi::Target & i_mba,
+         delete [] &l_dqBitmap;
+     }
+ 
+-    FAPI_INF("<<dimmGetBadDqBitmap");
++//    FAPI_INF("<<dimmGetBadDqBitmap");
+     return l_rc;
+ }
+ 
+@@ -190,7 +192,7 @@ fapi::ReturnCode dimmSetBadDqBitmap(
+     const uint8_t i_rank,
+     const uint8_t (&i_data)[DIMM_DQ_RANK_BITMAP_SIZE])
+ {
+-    FAPI_INF(">>dimmSetBadDqBitmap. %s:%d:%d:%d", i_mba.toEcmdString(), i_port, i_dimm, i_rank);
++  //  FAPI_INF(">>dimmSetBadDqBitmap. %s:%d:%d:%d", i_mba.toEcmdString(), i_port, i_dimm, i_rank);
+ 
+     fapi::ReturnCode l_rc;
+ 
+@@ -229,7 +231,7 @@ fapi::ReturnCode dimmSetBadDqBitmap(
+     }
+ 
+ 
+-    FAPI_INF("<<dimmSetBadDqBitmap");
++//    FAPI_INF("<<dimmSetBadDqBitmap");
+     return l_rc;
+ }
+ 
+diff --git a/src/usr/hwpf/hwp/mvpd_accessors/getMBvpdAttr.C b/src/usr/hwpf/hwp/mvpd_accessors/getMBvpdAttr.C
+index 5cb3cab..6bdf578 100644
+--- a/src/usr/hwpf/hwp/mvpd_accessors/getMBvpdAttr.C
++++ b/src/usr/hwpf/hwp/mvpd_accessors/getMBvpdAttr.C
+@@ -425,9 +425,9 @@ fapi::ReturnCode getVersion  (const fapi::Target    & i_mbaTarget,
+ 
+         if((l_fapirc == 0) && (!l_sizeMismatch))
+         {
+-            FAPI_INF("getVersion:"
+-                     " returned vm data : 0x%x ",
+-                     l_vmVersionBuf.iv_version);
++//            FAPI_INF("getVersion:"
++//                     " returned vm data : 0x%x ",
++//                     l_vmVersionBuf.iv_version);
+ 
+             // Get the first byte from VM keyword which has version value.
+             l_versionBuf = l_vmVersionBuf.iv_version;
+-- 
+1.8.2.2
+

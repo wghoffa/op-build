@@ -1,0 +1,35 @@
+From c1b05df59d7788cc92b0f2fa2350e78df052492e Mon Sep 17 00:00:00 2001
+From: Bill Schwartz <whs@us.ibm.com>
+Date: Fri, 4 Dec 2015 19:12:08 -0600
+Subject: [PATCH] Skip mss_check_RCD_protect_time
+
+Work around for step 13.10
+
+Change-Id: I100ff8cd4b4bf82233cf3224f767f8e5630d3906
+RTC:137707
+---
+ src/usr/hwpf/hwp/dram_training/mss_draminit_mc/mss_draminit_mc.C | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/usr/hwpf/hwp/dram_training/mss_draminit_mc/mss_draminit_mc.C b/src/usr/hwpf/hwp/dram_training/mss_draminit_mc/mss_draminit_mc.C
+index 23b6564..b18ce04 100644
+--- a/src/usr/hwpf/hwp/dram_training/mss_draminit_mc/mss_draminit_mc.C
++++ b/src/usr/hwpf/hwp/dram_training/mss_draminit_mc/mss_draminit_mc.C
+@@ -233,12 +233,12 @@ ReturnCode mss_draminit_mc_cloned(Target& i_target)
+ 
+         // Step Two.1: Check RCD protect time on RDIMM and LRDIMM
+         FAPI_INF( "+++ Check RCD protect time on RDIMM and LRDIMM +++");
+-        rc = mss_check_RCD_protect_time(l_mbaChiplets[i]);
++        /* rc = mss_check_RCD_protect_time(l_mbaChiplets[i]);
+         if(rc)
+         {
+            FAPI_ERR("---Error During Check RCD protect time rc = 0x%08X (creator = %d)---", uint32_t(rc), rc.getCreator());
+            return rc;
+-        }
++        }*/
+ 	
+ 	//Step Two.2: Enable address inversion on each MBA for ALL CARDS
+ 	FAPI_INF("+++ Setting up adr inversion for port 1 +++");
+-- 
+1.8.2.2
+

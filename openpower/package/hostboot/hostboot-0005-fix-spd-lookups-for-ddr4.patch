@@ -1,0 +1,93 @@
+From a3e3e3af527dde3f0d562122a3db840332dc4177 Mon Sep 17 00:00:00 2001
+From: Dan Crowell <dcrowell@us.ibm.com>
+Date: Mon, 12 Oct 2015 08:52:09 -0500
+Subject: [PATCH] Fix SPD lookups for DDR4
+
+Fix part and serial number size lookup
+Make revision common for DDR3/DDR4
+
+Change-Id: I61beb020d63d21e2edabf7632216be0a8716a383
+RTC: 137707
+---
+ src/include/usr/vpd/spdenums.H |  2 +-
+ src/usr/vpd/spd.C              | 26 ++++++++++++++++++--------
+ src/usr/vpd/spdDDR4.H          |  2 +-
+ 3 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/src/include/usr/vpd/spdenums.H b/src/include/usr/vpd/spdenums.H
+index b728e3f..38b11dc 100644
+--- a/src/include/usr/vpd/spdenums.H
++++ b/src/include/usr/vpd/spdenums.H
+@@ -139,7 +139,7 @@ enum
+     TRRDS_FINE_OFFSET                = SPD_FIRST_NORM_KEYWORD | 0x53,
+     TCKMAX_FINE_OFFSET               = SPD_FIRST_NORM_KEYWORD | 0x54,
+     BASE_CONFIG_CRC                  = SPD_FIRST_NORM_KEYWORD | 0x55,
+-    MODULE_REVISION_CODE_DDR4        = SPD_FIRST_NORM_KEYWORD | 0x56,
++    MODULE_REVISION_CODE_DDR4        = MODULE_REVISION_CODE,
+     DRAM_STEPPING                    = SPD_FIRST_NORM_KEYWORD | 0x57,
+     MANUFACTURING_SECTION_CRC        = SPD_FIRST_NORM_KEYWORD | 0x58,
+     SPD_LAST_NORM_KEYWORD            = SPD_FIRST_NORM_KEYWORD | 0x58,
+diff --git a/src/usr/vpd/spd.C b/src/usr/vpd/spd.C
+index 4bd6ad6..b497800 100644
+--- a/src/usr/vpd/spd.C
++++ b/src/usr/vpd/spd.C
+@@ -2039,18 +2039,28 @@ void setPartAndSerialNumberAttributes( TARGETING::Target * i_target )
+         }
+ 
+         // Get the keyword sizes
+-        size_t l_partDataSize = 0;
+-        size_t l_serialDataSize = 0;
+-        if( SPD_DDR3 == l_memType )
++        const KeywordData* entry = NULL;
++        l_err = getKeywordEntry( l_partKeyword,
++                                 l_memType,
++                                 i_target,
++                                 entry );
++        if( l_err )
+         {
+-            l_partDataSize = ddr3Data[l_partKeyword].length;
+-            l_serialDataSize = ddr3Data[l_serialKeyword].length;
++            break;
+         }
+-        else
++        size_t l_partDataSize = entry->length;
++
++        entry = NULL;
++        l_err = getKeywordEntry( l_serialKeyword,
++                                 l_memType,
++                                 i_target,
++                                 entry );
++        if( l_err )
+         {
+-            l_partDataSize = ddr4Data[l_partKeyword].length;
+-            l_serialDataSize = ddr4Data[l_serialKeyword].length;
++            break;
+         }
++        size_t l_serialDataSize = entry->length;
++        TRACDCOMP(g_trac_spd,"l_partDataSize=%d,l_serialDataSize=%d\n",l_partDataSize,l_serialDataSize);
+ 
+         //read the keywords from SEEPROM since PNOR may not be loaded yet
+         uint8_t l_partNumberData[l_partDataSize];
+diff --git a/src/usr/vpd/spdDDR4.H b/src/usr/vpd/spdDDR4.H
+index a3df6f3..d160d51 100755
+--- a/src/usr/vpd/spdDDR4.H
++++ b/src/usr/vpd/spdDDR4.H
+@@ -112,6 +112,7 @@ const KeywordData ddr4Data[] =
+     { DRAM_MANUFACTURER_ID,             0x15f,  0x02,   0x00,   0x00, true,  false, NA },
+     { MANUFACTURER_SPECIFIC_DATA,       0x161,  0x1d,   0x00,   0x00, false, false, NA },
+     { DIMM_BAD_DQ_DATA,                 0x180,  0x50,   0x00,   0x00, false, true,  NA },
++    { MODULE_REVISION_CODE,             0x15d,  0x01,   0x00,   0x00, false, false, NA },
+     // Normal fields supported on DDR4 only
+     { BANK_GROUP_BITS,                  0x04,   0x01,   0xC0,   0x06, false, false, NA },
+     { BANK_ADDRESS_BITS_DDR4,           0x04,   0x01,   0x30,   0x04, false, false, NA },
+@@ -132,7 +133,6 @@ const KeywordData ddr4Data[] =
+     { TRRDS_FINE_OFFSET,                0x77,   0x01,   0x00,   0x00, false, false, NA },
+     { TCKMAX_FINE_OFFSET,               0x7c,   0x01,   0x00,   0x00, false, false, NA },
+     { BASE_CONFIG_CRC,                  0x7f,   0x02,   0x00,   0x00, true,  false, NA },
+-    { MODULE_REVISION_CODE_DDR4,        0x15d,  0x01,   0x00,   0x00, false, false, NA },
+     { DRAM_STEPPING,                    0x160,  0x01,   0x00,   0x00, false, false, NA },
+     { MANUFACTURING_SECTION_CRC,        0x17f,  0x02,   0x00,   0x00, true,  false, NA },
+     // Module Specific fields supported on both DDR3 and DDR4
+-- 
+1.8.2.2
+
