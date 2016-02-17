@@ -1,0 +1,2806 @@
+From 4c0d368fe435327d7b50a1f4119330ba55dbeda5 Mon Sep 17 00:00:00 2001
+From: aalugore <aalugore@us.ibm.com>
+Date: Fri, 22 Jan 2016 13:36:14 -0600
+Subject: [PATCH 1/2] DDR4 - Allow SPD writes
+
+    -DDR4 has 512-byte EEPROM with 2 256-byte pages.
+     This commit contains the necessary page switching
+     logic to support this.
+
+Change-Id: Iaa8e3e344def98b71d6a9e9387c5e0d9137a0397
+RTC:137707
+ForwardPort: yes
+---
+ src/include/usr/devicefw/driverif.H                |  27 +-
+ src/include/usr/i2c/i2creasoncodes.H               |   6 +-
+ src/include/usr/vpd/spdenums.H                     |   4 +-
+ src/usr/i2c/eepromdd.C                             | 882 +++++++++++++++------
+ src/usr/i2c/eepromdd.H                             | 130 ++-
+ src/usr/i2c/i2c.C                                  | 551 +++++++++++--
+ src/usr/i2c/i2c.H                                  |  92 ++-
+ src/usr/ipmi/ipmifruinv.C                          |   5 +-
+ .../common/xmltohb/attribute_types_hb.xml          |  75 ++
+ .../targeting/common/xmltohb/target_types_hb.xml   |  14 +-
+ src/usr/vpd/spd.C                                  | 130 ++-
+ src/usr/vpd/spdDDR4.H                              |   4 +-
+ 12 files changed, 1578 insertions(+), 342 deletions(-)
+
+diff --git a/src/include/usr/devicefw/driverif.H b/src/include/usr/devicefw/driverif.H
+index 0842f73..61f4bb1 100644
+--- a/src/include/usr/devicefw/driverif.H
++++ b/src/include/usr/devicefw/driverif.H
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2011,2014                        */
++/* Contributors Listed Below - COPYRIGHT 2011,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -132,6 +132,31 @@ namespace DeviceFW
+     #define DEVICE_I2C_ADDRESS_OFFSET( i_port, i_engine, i_devAddr, i_offset_len, i_offset)\
+         DeviceFW::I2C,  DEVICE_I2C_PARMS(i_port, i_engine, i_devAddr, i_offset_len, i_offset)
+ 
++
++    /**
++     * Construct the device addressing parameters for locking the page
++     * attribute of an I2C master target
++     *
++     * @param[in] i_port - Which port to use from the I2C master.
++     * @param[in] i_engine - Which I2C master engine to use.
++     * @param[in] i_shouldLock - bool to determine whether we are
++     *                           attempting to lock or unlock the page.
++     * @param[in] i_desired_page - The EEPROM page we want to switch to
++     *                             iff a page switch is needed.
++     * @param[in] i_lockMutex - bool to determine whether we actually
++     *             want to lock the page mutex or not. This bool allows
++     *             us to switch pages mid read without hitting a deadlock.
++     */
++#define DEVICE_I2C_CONTROL_PAGE_OP( i_port, i_engine, i_shouldLock, i_desired_page, i_lockMutex )\
++            DeviceFW::I2C,\
++            static_cast<uint64_t>(i_port),\
++            static_cast<uint64_t>(i_engine),\
++            0xff,\
++            static_cast<uint64_t>(i_shouldLock),\
++            static_cast<uint64_t>(i_desiredPage),\
++            static_cast<uint64_t>(i_lockMutex)
++
++
+     /**
+      * Construct the device addressing parameters for the Host I2C device ops.
+      * @param[in] i_port - Which port to use from the I2C master.
+diff --git a/src/include/usr/i2c/i2creasoncodes.H b/src/include/usr/i2c/i2creasoncodes.H
+index fda1c14..52888c5 100644
+--- a/src/include/usr/i2c/i2creasoncodes.H
++++ b/src/include/usr/i2c/i2creasoncodes.H
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2011,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2011,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -59,6 +59,8 @@ enum i2cModuleId
+     I2C_SEND_SLAVE_STOP                 = 0x09,
+     I2C_PROCESS_ACTIVE_MASTERS          = 0x0A,
+     I2C_FORCE_RESET_AND_UNLOCK          = 0x0B,
++    I2C_PAGE_LOCK_OP                    = 0x0C,
++    I2C_PAGE_UNLOCK_OP                  = 0x0D,
+ };
+ 
+ 
+@@ -86,6 +88,8 @@ enum i2cReasonCode
+     I2C_RUNTIME_INTERFACE_ERR           = I2C_COMP_ID | 0x0D,   // Read/write unavailable at runtime
+     I2C_RUNTIME_ERR                     = I2C_COMP_ID | 0x0E,   // Failed run-time operation
+     I2C_RUNTIME_INVALID_OFFSET_LENGTH   = I2C_COMP_ID | 0x0F,   // Offset length of invalid size
++    I2C_INVALID_EEPROM_PAGE_MUTEX       = I2C_COMP_ID | 0x10,   // Error getting page mutex for i2c engine.
++    I2C_INVALID_EEPROM_PAGE_REQUEST     = I2C_COMP_ID | 0x11,   // Invalid EEPROM page request
+ };
+ 
+ 
+diff --git a/src/include/usr/vpd/spdenums.H b/src/include/usr/vpd/spdenums.H
+index b728e3f..9decbe8 100644
+--- a/src/include/usr/vpd/spdenums.H
++++ b/src/include/usr/vpd/spdenums.H
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2013,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2013,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -139,7 +139,7 @@ enum
+     TRRDS_FINE_OFFSET                = SPD_FIRST_NORM_KEYWORD | 0x53,
+     TCKMAX_FINE_OFFSET               = SPD_FIRST_NORM_KEYWORD | 0x54,
+     BASE_CONFIG_CRC                  = SPD_FIRST_NORM_KEYWORD | 0x55,
+-    MODULE_REVISION_CODE_DDR4        = SPD_FIRST_NORM_KEYWORD | 0x56,
++    MODULE_REVISION_CODE_DDR4        = MODULE_REVISION_CODE,
+     DRAM_STEPPING                    = SPD_FIRST_NORM_KEYWORD | 0x57,
+     MANUFACTURING_SECTION_CRC        = SPD_FIRST_NORM_KEYWORD | 0x58,
+     SPD_LAST_NORM_KEYWORD            = SPD_FIRST_NORM_KEYWORD | 0x58,
+diff --git a/src/usr/i2c/eepromdd.C b/src/usr/i2c/eepromdd.C
+index 55b136c..c775137 100755
+--- a/src/usr/i2c/eepromdd.C
++++ b/src/usr/i2c/eepromdd.C
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2011,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2011,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -114,7 +114,7 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+                             va_list i_args )
+ {
+     errlHndl_t err = NULL;
+-    TARGETING::Target * theTarget = NULL;
++    TARGETING::Target * i2cMasterTarget = NULL;
+     eeprom_addr_t i2cInfo;
+ 
+     i2cInfo.chip = va_arg( i_args, uint64_t );
+@@ -124,7 +124,7 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+                ENTER_MRK"eepromPerformOp()" );
+ 
+     TRACUCOMP (g_trac_eeprom, ENTER_MRK"eepromPerformOp(): "
+-               "i_opType=%d, chip=%d, offset=%d, len=%d",
++               "i_opType=%d, chip=%d, offset=%x, len=%d",
+                (uint64_t) i_opType, i2cInfo.chip, i2cInfo.offset, io_buflen);
+ 
+ #ifdef __HOSTBOOT_RUNTIME
+@@ -149,7 +149,7 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+         // the I2C Master
+         err = eepromGetI2CMasterTarget( i_target,
+                                         i2cInfo,
+-                                        theTarget );
++                                        i2cMasterTarget );
+ 
+         if( err )
+         {
+@@ -196,10 +196,10 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+ 
+ #ifdef __HOSTBOOT_RUNTIME
+         // Disable Sensor Cache if the I2C master target is MEMBUF
+-        if( theTarget->getAttr<TARGETING::ATTR_TYPE>() ==
++        if( i2cMasterTarget->getAttr<TARGETING::ATTR_TYPE>() ==
+                                                     TARGETING::TYPE_MEMBUF )
+         {
+-            err = I2C::i2cDisableSensorCache(theTarget,scacDisabled);
++            err = I2C::i2cDisableSensorCache(i2cMasterTarget,scacDisabled);
+             if ( err )
+             {
+                 break;
+@@ -210,7 +210,7 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+         // Do the read or write
+         if( i_opType == DeviceFW::READ )
+         {
+-            err = eepromRead( theTarget,
++            err = eepromRead( i2cMasterTarget,
+                               io_buffer,
+                               io_buflen,
+                               i2cInfo );
+@@ -223,7 +223,7 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+         }
+         else if( i_opType == DeviceFW::WRITE )
+         {
+-            err = eepromWrite( theTarget,
++            err = eepromWrite( i2cMasterTarget,
+                                io_buffer,
+                                io_buflen,
+                                i2cInfo );
+@@ -265,18 +265,18 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+     // Re-enable sensor cache if it was disabled before the eeprom op and
+     // the I2C master target is MEMBUF
+     if( scacDisabled &&
+-       (theTarget->getAttr<TARGETING::ATTR_TYPE>() == TARGETING::TYPE_MEMBUF) )
++       (i2cMasterTarget->getAttr<TARGETING::ATTR_TYPE>() == TARGETING::TYPE_MEMBUF) )
+     {
+         errlHndl_t tmp_err = NULL;
+ 
+-        tmp_err = I2C::i2cEnableSensorCache(theTarget);
++        tmp_err = I2C::i2cEnableSensorCache(i2cMasterTarget);
+ 
+         if( err && tmp_err)
+         {
+             delete tmp_err;
+             TRACFCOMP(g_trac_eeprom,
+                 ERR_MRK" Enable Sensor Cache failed for HUID=0x%.8X",
+-                TARGETING::get_huid(theTarget));
++                TARGETING::get_huid(i2cMasterTarget));
+         }
+         else if(tmp_err)
+         {
+@@ -308,12 +308,11 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+ //-------------------------------------------------------------------
+ bool eepromPresence ( TARGETING::Target * i_target )
+ {
+-
+-    TRACDCOMP(g_trac_eeprom, ENTER_MRK"eepromPresence()");
++    TRACUCOMP(g_trac_eeprom, ENTER_MRK"eepromPresence()");
+ 
+     errlHndl_t err = NULL;
+     bool l_present = false;
+-    TARGETING::Target * theTarget = NULL;
++    TARGETING::Target * i2cMasterTarget = NULL;
+ 
+     eeprom_addr_t i2cInfo;
+ 
+@@ -337,7 +336,7 @@ bool eepromPresence ( TARGETING::Target * i_target )
+         // the I2C Master
+         err = eepromGetI2CMasterTarget( i_target,
+                                         i2cInfo,
+-                                        theTarget );
++                                        i2cMasterTarget );
+ 
+         if( err )
+         {
+@@ -347,7 +346,7 @@ bool eepromPresence ( TARGETING::Target * i_target )
+         }
+ 
+         //Check for the target at the I2C level
+-        l_present = I2C::i2cPresence(theTarget,
++        l_present = I2C::i2cPresence(i2cMasterTarget,
+                           i2cInfo.port,
+                           i2cInfo.engine,
+                           i2cInfo.devAddr );
+@@ -367,6 +366,120 @@ bool eepromPresence ( TARGETING::Target * i_target )
+ #endif
+ 
+ 
++
++// ------------------------------------------------------------------
++// eepromPageOp
++// ------------------------------------------------------------------
++errlHndl_t eepromPageOp( TARGETING::Target * i_target,
++                         bool i_switchPage,
++                         bool i_lockMutex,
++                         bool & io_pageLocked,
++                         uint8_t i_desiredPage,
++                         eeprom_addr_t i_i2cInfo )
++{
++    TRACUCOMP(g_trac_eeprom,
++            ENTER_MRK"eepromPageOp()");
++
++    errlHndl_t l_err = NULL;
++    size_t l_placeHolderZero = 0;
++
++    // DDR4 requires EEPROM page to be selected before read/write operation.
++    // The following operation locks the EEPROM_PAGE attribute behind a
++    // mutex and switches all DIMMs on the I2C bus to the appropriate
++    // page.
++    if( i_i2cInfo.addrSize == ONE_BYTE_ADDR_PAGESELECT )
++    {
++
++        bool l_lockPage;
++        if( i_switchPage )
++        {
++            // we want to switch to the desired page
++            l_lockPage = true;
++            l_err = deviceOp( DeviceFW::WRITE,
++                            i_target,
++                            NULL,
++                            l_placeHolderZero,
++                            DEVICE_I2C_CONTROL_PAGE_OP(
++                                i_i2cInfo.port,
++                                i_i2cInfo.engine,
++                                l_lockPage,
++                                i_desiredPage,
++                                i_lockMutex ));
++
++            if( l_err )
++            {
++                TRACFCOMP(g_trac_eeprom,
++                        "eepromPageOp::Failed locking EEPROM page");
++                //errlCommit(err, EEPROM_COMP_ID); TODO COMMIT OUTSIDE
++            }
++            // if we make it this far, we successfully locked the page mutex
++            io_pageLocked = true;
++        }
++        else
++        {
++            // we only want to unlock the page
++            l_lockPage = false;
++            l_err = deviceOp( DeviceFW::WRITE,
++                            i_target,
++                            NULL,
++                            l_placeHolderZero,
++                            DEVICE_I2C_CONTROL_PAGE_OP(
++                                i_i2cInfo.port,
++                                i_i2cInfo.engine,
++                                l_lockPage,
++                                l_placeHolderZero,
++                                i_lockMutex ));
++
++            if( l_err )
++            {
++                TRACFCOMP( g_trac_eeprom,
++                        "eepromPageOp()::failed unlocking EEPROM page");
++            }
++            // if we make it this far, we successfully unlocked the page
++            io_pageLocked = false;
++        }
++    }
++
++    TRACUCOMP(g_trac_eeprom,
++            EXIT_MRK"eepromPageOp()");
++    return l_err;
++}
++
++
++// ------------------------------------------------------------------
++// crossesEepromPageBoundary
++// ------------------------------------------------------------------
++bool crossesEepromPageBoundary( uint64_t i_originalOffset,
++                                size_t i_originalLen,
++                                size_t & io_newLen,
++                                size_t & o_pageTwoBuflen )
++{
++    bool l_boundaryCrossed = false;
++    size_t l_higherBound = i_originalOffset + i_originalLen;
++
++    if( (i_originalOffset < EEPROM_PAGE_SIZE) &&
++        (l_higherBound > EEPROM_PAGE_SIZE) )
++    {
++        // The read/write request crosses the boundary
++        l_boundaryCrossed = true;
++
++        // Calculate the new length of the page 0 buffer and the
++        // length of the page 1 buffer
++        o_pageTwoBuflen = l_higherBound - EEPROM_PAGE_SIZE;
++        io_newLen = i_originalLen - o_pageTwoBuflen;
++    }
++    else
++    {
++        // The read/write request does not cross the boundary.
++        // Update new length to be used by subsequent operations
++        io_newLen = i_originalLen;
++        o_pageTwoBuflen = 0;
++    }
++    return l_boundaryCrossed;
++}
++
++
++
+ // ------------------------------------------------------------------
+ // eepromRead
+ // ------------------------------------------------------------------
+@@ -376,33 +489,193 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                         eeprom_addr_t i_i2cInfo )
+ {
+     errlHndl_t err = NULL;
+-    errlHndl_t err_NACK = NULL;
+     uint8_t byteAddr[MAX_BYTE_ADDR];
+     size_t byteAddrSize = 0;
+-    bool unlock = false;
++    bool l_pageLocked = false;
++    uint8_t l_desiredPage = 0;
++    bool l_boundaryCrossed = false;
++    size_t l_readBuflen = 0;
++    size_t l_pageTwoBuflen = 0;
+ 
+-    TRACDCOMP( g_trac_eeprom,
++    TRACUCOMP( g_trac_eeprom,
+                ENTER_MRK"eepromRead()" );
+ 
+     do
+     {
+-        TRACSCOMP( g_trac_eepromr,
++        TRACUCOMP( g_trac_eepromr,
+                    "EEPROM READ  START : Chip: %02d : Offset %.2X : Len %d",
+                    i_i2cInfo.chip, i_i2cInfo.offset, i_buflen );
+ 
+-        err = eepromPrepareAddress( &byteAddr,
++
++        // Check to see if the Read operation straddles the EEPROM page boundary
++        l_boundaryCrossed = crossesEepromPageBoundary( i_i2cInfo.offset,
++                                                       i_buflen,
++                                                       l_readBuflen,
++                                                       l_pageTwoBuflen );
++
++
++        // Set addressing parameters
++        err = eepromPrepareAddress( i_target,
++                                    &byteAddr,
+                                     byteAddrSize,
+-                                    i_i2cInfo );
++                                    l_desiredPage,
++                                    i_i2cInfo);
+ 
+         if( err )
+         {
++            TRACFCOMP(g_trac_eeprom,
++                    ERR_MRK"eepromRead()::eepromPrepareAddress()");
++            break;
++        }
++
++
++        // Attempt to lock page mutex
++        bool l_switchPage = true;
++        bool l_lockMutex = true;
++        err = eepromPageOp( i_target,
++                            l_switchPage,
++                            l_lockMutex,
++                            l_pageLocked,
++                            l_desiredPage,
++                            i_i2cInfo );
++
++        if( err )
++        {
++            TRACFCOMP(g_trac_eeprom,
++                    "eepromRead()::eepromPageOp()::failed locking page");
+             break;
+         }
+ 
+         // Lock to sequence operations
+         mutex_lock( &g_eepromMutex );
+-        unlock = true;
+ 
++        // First Read. If Second read is necessary, this call will read
++        // everything from the original offset up to the 256th byte
++        err = eepromReadData( i_target,
++                              o_buffer,
++                              l_readBuflen,
++                              &byteAddr,
++                              byteAddrSize,
++                              i_i2cInfo );
++        if( err )
++        {
++            TRACFCOMP(g_trac_eeprom,
++                    "Failed reading data: original read");
++            break;
++        }
++
++
++        // Perform the second Read if necessary. Read starts at
++        // begining of EEPROM page 1 (offset=0x100) and reads the
++        // rest of the required data.
++        if( l_boundaryCrossed )
++        {
++            //Prepare the address to read at the start of EEPROM page one
++            i_i2cInfo.offset = EEPROM_PAGE_SIZE; // 0x100
++            err = eepromPrepareAddress( i_target,
++                                        &byteAddr,
++                                        byteAddrSize,
++                                        l_desiredPage,
++                                        i_i2cInfo );
++            if( err )
++            {
++                TRACFCOMP(g_trac_eeprom,
++                        "Error preparing address: second eeprom read");
++                break;
++            }
++
++            // Switch to the second EEPROM page
++            l_switchPage = true;
++            l_lockMutex = false;
++            err = eepromPageOp( i_target,
++                                l_switchPage,
++                                l_lockMutex,
++                                l_pageLocked,
++                                l_desiredPage,
++                                i_i2cInfo );
++
++            if( err )
++            {
++                TRACFCOMP( g_trac_eeprom,
++                        "Failed switching to EEPROM page 1 for second read op");
++                break;
++            }
++
++            // Perform the second read operation
++            err = eepromReadData(
++                           i_target,
++                           &reinterpret_cast<uint8_t*>(o_buffer)[l_readBuflen],
++                           l_pageTwoBuflen,
++                           &byteAddr,
++                           byteAddrSize,
++                           i_i2cInfo );
++
++            if( err )
++            {
++                TRACFCOMP( g_trac_eeprom,
++                         "Failed reading data: second read");
++                break;
++            }
++        }
++
++
++
++
++        TRACUCOMP( g_trac_eepromr,
++                   "EEPROM READ  END   : Chip: %02d : Offset %.2X : Len %d : %016llx",
++                   i_i2cInfo.chip, l_originalOffset, i_buflen,
++                   *((uint64_t*)o_buffer) );
++
++    } while( 0 );
++
++    // Unlock eeprom mutex no matter what
++    mutex_unlock( & g_eepromMutex );
++
++    // Whether we failed in the main routine or not, unlock page iff the page is locked
++    if( l_pageLocked )
++    {
++        errlHndl_t l_pageOpErrl = NULL;
++        bool l_switchPage = false;
++        bool l_lockMutex = false;
++        l_pageOpErrl = eepromPageOp( i_target,
++                                     l_switchPage,
++                                     l_lockMutex,
++                                     l_pageLocked,
++                                     l_desiredPage,
++                                     i_i2cInfo );
++        if( l_pageOpErrl )
++        {
++            TRACFCOMP(g_trac_eeprom,
++                    "eepromRead()::Failed unlocking page");
++            errlCommit(l_pageOpErrl, I2C_COMP_ID);
++        }
++
++    }
++
++    TRACUCOMP( g_trac_eeprom,
++               EXIT_MRK"eepromRead()" );
++
++    return err;
++} // end eepromRead
++
++
++// ------------------------------------------------------------------
++// eepromReadData
++// ------------------------------------------------------------------
++errlHndl_t eepromReadData( TARGETING::Target * i_target,
++                           void * o_buffer,
++                           size_t i_buflen,
++                           void * i_byteAddress,
++                           size_t i_byteAddressSize,
++                           eeprom_addr_t i_i2cInfo )
++{
++    errlHndl_t l_err = NULL;
++    errlHndl_t err_NACK = NULL;
++
++    TRACUCOMP(g_trac_eeprom,
++            ENTER_MRK"eepromReadData()");
++    do
++    {
+         /***********************************************************/
+         /* Attempt read multiple times ONLY on NACK fails         */
+         /***********************************************************/
+@@ -412,10 +685,10 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+         {
+ 
+             // Only write the byte address if we have data to write
+-            if( 0 != byteAddrSize )
++            if( 0 != i_byteAddressSize )
+             {
+                 // Use the I2C OFFSET Interface for the READ
+-                err = deviceOp( DeviceFW::READ,
++                l_err = deviceOp( DeviceFW::READ,
+                                 i_target,
+                                 o_buffer,
+                                 i_buflen,
+@@ -423,18 +696,18 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                                        i_i2cInfo.port,
+                                        i_i2cInfo.engine,
+                                        i_i2cInfo.devAddr,
+-                                       byteAddrSize,
+-                                       reinterpret_cast<uint8_t*>(&byteAddr)));
++                                       i_byteAddressSize,
++                                       reinterpret_cast<uint8_t*>(i_byteAddress)));
+ 
+-                if( err )
++                if( l_err )
+                 {
+                     TRACFCOMP(g_trac_eeprom,
+-                              ERR_MRK"eepromRead(): I2C Read-Offset failed on "
++                              ERR_MRK"eepromReadData(): I2C Read-Offset failed on "
+                               "%d/%d/0x%X aS=%d",
+                               i_i2cInfo.port, i_i2cInfo.engine,
+-                              i_i2cInfo.devAddr, byteAddrSize);
+-                    TRACFBIN(g_trac_eeprom, "byteAddr[]",
+-                             &byteAddr, byteAddrSize);
++                              i_i2cInfo.devAddr, i_byteAddressSize);
++                    TRACFBIN(g_trac_eeprom, "i_byteAddress[]",
++                             i_byteAddress, i_byteAddressSize);
+ 
+                     // Don't break here -- error handled below
+                 }
+@@ -442,7 +715,7 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+             else
+             {
+                 // Do the actual read via I2C
+-                err = deviceOp( DeviceFW::READ,
++                l_err = deviceOp( DeviceFW::READ,
+                                 i_target,
+                                 o_buffer,
+                                 i_buflen,
+@@ -450,10 +723,10 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                                                     i_i2cInfo.engine,
+                                                     i_i2cInfo.devAddr ) );
+ 
+-                if( err )
++                if( l_err )
+                 {
+                     TRACFCOMP(g_trac_eeprom,
+-                              ERR_MRK"eepromRead(): I2C Read failed on "
++                              ERR_MRK"eepromReadData(): I2C Read failed on "
+                               "%d/%d/0x%0X", i_i2cInfo.port, i_i2cInfo.engine,
+                               i_i2cInfo.devAddr);
+ 
+@@ -461,23 +734,24 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                 }
+             }
+ 
+-            if ( err == NULL )
++            if ( l_err == NULL )
+             {
+                 // Operation completed successfully
+                 // break from retry loop
+                 break;
+             }
+-            else if ( err->reasonCode() != I2C::I2C_NACK_ONLY_FOUND )
++            else if ( l_err->reasonCode() != I2C::I2C_NACK_ONLY_FOUND )
+             {
+                 // Only retry on NACK failures: break from retry loop
+-                TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromRead(): Non-Nack "
++                TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromReadData(): Non-Nack "
+                            "Error: rc=0x%X, tgt=0x%X, No Retry (retry=%d)",
+-                            err->reasonCode(),
++                            l_err->reasonCode(),
+                             TARGETING::get_huid(i_target), retry);
+ 
+-                err->collectTrace(EEPROM_COMP_NAME);
++                l_err->collectTrace(EEPROM_COMP_NAME);
+ 
+                 // break from retry loop
++                // UNLOCK PAGE
+                 break;
+             }
+             else // Handle NACK error
+@@ -489,9 +763,9 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                     if ( err_NACK == NULL )
+                     {
+                         // Save original NACK error
+-                        err_NACK = err;
++                        err_NACK = l_err;
+ 
+-                        TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromRead(): "
++                        TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromReadData(): "
+                                    "NACK Error rc=0x%X, eid=0x%X, tgt=0x%X, "
+                                    "retry/MAX=%d/%d. Save error and retry",
+                                    err_NACK->reasonCode(),
+@@ -504,11 +778,11 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                     else
+                     {
+                         // Add data to original NACK error
+-                        TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromRead(): "
++                        TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromReadData(): "
+                                    "Another NACK Error rc=0x%X, eid=0x%X "
+                                    "plid=0x%X, tgt=0x%X, retry/MAX=%d/%d. "
+                                    "Delete error and retry",
+-                                   err->reasonCode(), err->eid(), err->plid(),
++                                   l_err->reasonCode(), l_err->eid(), l_err->plid(),
+                                    TARGETING::get_huid(i_target),
+                                    retry, EEPROM_MAX_NACK_RETRIES);
+ 
+@@ -517,8 +791,8 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                                   .addToLog(err_NACK);
+ 
+                         // Delete this new NACK error
+-                        delete err;
+-                        err = NULL;
++                        delete l_err;
++                        l_err = NULL;
+                     }
+ 
+                     // continue to retry
+@@ -526,14 +800,14 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                 }
+                 else // no more retries: trace and break
+                 {
+-                    TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromRead(): "
++                    TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromReadData(): "
+                                "Error rc=0x%X, eid=%d, tgt=0x%X. No More "
+                                "Retries (retry/MAX=%d/%d). Returning Error",
+-                               err->reasonCode(), err->eid(),
++                               l_err->reasonCode(), l_err->eid(),
+                                TARGETING::get_huid(i_target),
+                                retry, EEPROM_MAX_NACK_RETRIES);
+ 
+-                    err->collectTrace(EEPROM_COMP_NAME);
++                    l_err->collectTrace(EEPROM_COMP_NAME);
+ 
+                     // break from retry loop
+                     break;
+@@ -545,12 +819,12 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+         // Handle saved NACK error, if any
+         if (err_NACK)
+         {
+-            if (err)
++            if (l_err)
+             {
+                 // commit original NACK error with new err PLID
+-                err_NACK->plid(err->plid());
+-                TRACFCOMP(g_trac_eeprom, "eepromRead(): Committing saved NACK "
+-                          "err eid=0x%X with plid of returned err: 0x%X",
++                err_NACK->plid(l_err->plid());
++                TRACFCOMP(g_trac_eeprom, "eepromReadData(): Committing saved NACK "
++                          "l_err eid=0x%X with plid of returned err: 0x%X",
+                           err_NACK->eid(), err_NACK->plid());
+ 
+                 ERRORLOG::ErrlUserDetailsTarget(i_target)
+@@ -561,7 +835,7 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+             else
+             {
+                 // Since we eventually succeeded, delete original NACK error
+-                TRACFCOMP(g_trac_eeprom, "eepromRead(): Op successful, "
++                TRACFCOMP(g_trac_eeprom, "eepromReadData(): Op successful, "
+                           "deleting saved NACK err eid=0x%X, plid=0x%X",
+                           err_NACK->eid(), err_NACK->plid());
+ 
+@@ -570,28 +844,13 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+             }
+         }
+ 
++    }while( 0 );
+ 
+-        mutex_unlock( &g_eepromMutex );
+-        unlock = false;
+-
+-        TRACSCOMP( g_trac_eepromr,
+-                   "EEPROM READ  END   : Chip: %02d : Offset %.2X : Len %d : %016llx",
+-                   i_i2cInfo.chip, i_i2cInfo.offset, i_buflen,
+-                   *((uint64_t*)o_buffer) );
+-
+-    } while( 0 );
+-
+-    // Catch it if we break out early.
+-    if( unlock )
+-    {
+-        mutex_unlock( & g_eepromMutex );
+-    }
+-
+-    TRACDCOMP( g_trac_eeprom,
+-               EXIT_MRK"eepromRead()" );
++    TRACFCOMP(g_trac_eeprom,
++            EXIT_MRK"eepromReadData");
++    return l_err;
++}
+ 
+-    return err;
+-} // end eepromRead
+ 
+ 
+ // ------------------------------------------------------------------
+@@ -603,31 +862,61 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+                          eeprom_addr_t i_i2cInfo )
+ {
+     errlHndl_t err = NULL;
+-    errlHndl_t err_NACK = NULL;
++    uint8_t l_desiredPage = 0;
+     uint8_t byteAddr[MAX_BYTE_ADDR];
+     size_t byteAddrSize = 0;
+     uint8_t * newBuffer = NULL;
+     bool needFree = false;
+     bool unlock = false;
++    bool l_pageLocked = false;
++    bool l_boundaryCrossed = false;
+     uint32_t data_left = 0;
+     uint32_t diff_wps = 0;
++    size_t l_writeBuflen = 0;
++    size_t l_bytesIntoSecondPage = 0;
++    uint64_t l_tempOffset = 0;
+ 
+     TRACDCOMP( g_trac_eeprom,
+                ENTER_MRK"eepromWrite()" );
+ 
+     do
+     {
+-        TRACSCOMP( g_trac_eepromr,
++        TRACUCOMP( g_trac_eeprom,
+                    "EEPROM WRITE START : Chip: %02d : Offset %.2X : Len %d : %016llx",
+                    i_i2cInfo.chip, i_i2cInfo.offset, io_buflen,
+                    *((uint64_t*)io_buffer) );
+ 
+-        err = eepromPrepareAddress( &byteAddr,
++
++        // Prepare address parameters
++        err = eepromPrepareAddress( i_target,
++                                    &byteAddr,
+                                     byteAddrSize,
+-                                    i_i2cInfo );
++                                    l_desiredPage,
++                                    i_i2cInfo);
+ 
+         if( err )
+         {
++            TRACFCOMP(g_trac_eeprom,
++                    ERR_MRK"eepromWrite()::eepromPrepareAddress()");
++            break;
++        }
++
++        // Attempt to lock page mutex
++        bool l_switchPage = true; // true: Lock and switch page
++                                  // false: Just unlock page
++        bool l_lockMutex = true;  // true: Lock mutex
++                                  // false: Skip locking mutex step
++        err = eepromPageOp( i_target,
++                            l_switchPage,
++                            l_lockMutex,
++                            l_pageLocked,
++                            l_desiredPage,
++                            i_i2cInfo );
++
++        if( err )
++        {
++            TRACFCOMP(g_trac_eeprom,
++                    "eepromWrite()::Failed locking EEPROM page");
+             break;
+         }
+ 
+@@ -677,7 +966,6 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+         size_t loop_data_length = 0;
+         size_t total_bytes_written = 0;
+ 
+-
+         for ( uint64_t i = 0 ;
+               total_bytes_written < io_buflen ;
+               i++ )
+@@ -701,13 +989,26 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+                     loop_data_length );
+ 
+ 
++
++            // Check if loop_data_length crosses the EEPROM page boundary
++            l_boundaryCrossed = crossesEepromPageBoundary( i_i2cInfo.offset,
++                                                           loop_data_length,
++                                                           l_writeBuflen,
++                                                           l_bytesIntoSecondPage );
++
++
+             // Setup offset/address parms
+-            err = eepromPrepareAddress(  &byteAddr,
+-                                         byteAddrSize,
+-                                         i_i2cInfo );
++            err = eepromPrepareAddress( i_target,
++                                        &byteAddr,
++                                        byteAddrSize,
++                                        l_desiredPage,
++                                        i_i2cInfo );
++
+ 
+             if( err )
+             {
++                TRACFCOMP(g_trac_eeprom,
++                         ERR_MRK"eepromWrite::eepromPrepareAddress()::loop version");
+                 break;
+             }
+ 
+@@ -717,157 +1018,81 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+                 i, loop_data_length, i_i2cInfo.offset, byteAddrSize,
+                 data_left, diff_wps);
+ 
+-            /***********************************************************/
+-            /* Attempt write multiple times ONLY on NACK fails         */
+-            /***********************************************************/
+-            for (uint8_t retry = 0;
+-                 retry <= EEPROM_MAX_NACK_RETRIES;
+-                 retry++)
++
++            // Perform the requested write operation
++            err = eepromWriteData( i_target,
++                                   newBuffer,
++                                   l_writeBuflen,
++                                   &byteAddr,
++                                   byteAddrSize,
++                                   i_i2cInfo );
++
++            if ( err )
+             {
+-                // Do the actual data write
+-                err = deviceOp( DeviceFW::WRITE,
+-                                i_target,
+-                                newBuffer,
+-                                loop_data_length,
+-                                DEVICE_I2C_ADDRESS_OFFSET(
+-                                               i_i2cInfo.port,
+-                                               i_i2cInfo.engine,
+-                                               i_i2cInfo.devAddr,
+-                                               byteAddrSize,
+-                                               reinterpret_cast<uint8_t*>(
+-                                               &byteAddr)));
++                // Can't assume that anything was written if
++                // there was an error, so no update to total_bytes_written
++                // for this loop
++                TRACFCOMP(g_trac_eeprom,
++                        "Failed writing data: original eeprom write");
++                break;
++            }
+ 
+ 
+-                if ( err == NULL )
+-                {
+-                    // Operation completed successfully
+-                    // break from retry loop
+-                    break;
+-                }
+-                else if ( err->reasonCode() != I2C::I2C_NACK_ONLY_FOUND )
+-                {
+-                    // Only retry on NACK failures: break from retry loop
+-                    TRACFCOMP(g_trac_eeprom, ERR_MRK"eepromWrite(): I2C "
+-                              "Write Non-NACK fail %d/%d/0x%X loop=%d, "
+-                              "ldl=%d, offset=0x%X, aS=%d, retry=%d",
+-                              i_i2cInfo.port, i_i2cInfo.engine,
+-                              i_i2cInfo.devAddr, i, loop_data_length,
+-                              i_i2cInfo.offset, i_i2cInfo.addrSize, retry);
++            // Perform another write on second EEPROM page if necessary
++            if( l_boundaryCrossed )
++            {
++                l_tempOffset = i_i2cInfo.offset;
++                i_i2cInfo.offset = EEPROM_PAGE_SIZE; // 0x100
+ 
+-                    err->collectTrace(EEPROM_COMP_NAME);
++                err = eepromPrepareAddress( i_target,
++                                            &byteAddr,
++                                            byteAddrSize,
++                                            l_desiredPage,
++                                            i_i2cInfo );
+ 
+-                    // break from retry loop
++                if( err )
++                {
++                    TRACFCOMP( g_trac_eeprom,
++                            "Failure: eepromWrite()::eepromPrepareAddress()");
+                     break;
+                 }
+-                else // Handle NACK error
+-                {
+-                    TRACFCOMP(g_trac_eeprom, ERR_MRK"eepromWrite(): I2C "
+-                              "Write NACK fail %d/%d/0x%X loop=%d, "
+-                              "ldl=%d, offset=0x%X, aS=%d",
+-                              i_i2cInfo.port, i_i2cInfo.engine,
+-                              i_i2cInfo.devAddr, i, loop_data_length,
+-                              i_i2cInfo.offset, i_i2cInfo.addrSize);
+ 
+-                    // If op will be attempted again: save error and continue
+-                    if ( retry < EEPROM_MAX_NACK_RETRIES )
+-                    {
+-                        // Only save original NACK error
+-                        if ( err_NACK == NULL )
+-                        {
+-                            // Save original NACK error
+-                            err_NACK = err;
+-
+-                            TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromWrite(): "
+-                                       "Error rc=0x%X, eid=0x%X plid=0x%X, "
+-                                       "tgt=0x%X, retry/MAX=%d/%d. Save error "
+-                                       "and retry",
+-                                       err_NACK->reasonCode(),
+-                                       err_NACK->eid(),
+-                                       err_NACK->plid(),
+-                                       TARGETING::get_huid(i_target),
+-                                       retry, EEPROM_MAX_NACK_RETRIES);
+-
+-                            err_NACK->collectTrace(EEPROM_COMP_NAME);
+-                        }
+-                        else
+-                        {
+-                            // Add data to original NACK error
+-                            TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromWrite(): "
+-                                       "Another NACK Error rc=0x%X, eid=0x%X "
+-                                       "plid=0x%X, tgt=0x%X, retry/MAX=%d/%d. "
+-                                       "Delete error and retry",
+-                                       err->reasonCode(), err->eid(),
+-                                       err->plid(),
+-                                       TARGETING::get_huid(i_target),
+-                                       retry, EEPROM_MAX_NACK_RETRIES);
+-
+-                            ERRORLOG::ErrlUserDetailsString(
+-                                      "Another NACK ERROR found")
+-                                      .addToLog(err_NACK);
+-
+-                            // Delete this new NACK error
+-                            delete err;
+-                            err = NULL;
+-                        }
+-
+-                        // continue to retry
+-                        continue;
+-                    }
+-                    else // no more retries: trace and break
+-                    {
+-                        TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromWrite(): "
+-                                   "Error rc=0x%X, tgt=0x%X. No More Retries "
+-                                   "(retry/MAX=%d/%d). Returning Error",
+-                                   err->reasonCode(),
+-                                   TARGETING::get_huid(i_target),
+-                                   retry, EEPROM_MAX_NACK_RETRIES);
+-
+-                        err->collectTrace(EEPROM_COMP_NAME);
++                // Switch to the second EEPROM page
++                l_switchPage = true;
++                l_lockMutex = false;
++                err = eepromPageOp( i_target,
++                                    l_switchPage,
++                                    l_lockMutex,
++                                    l_pageLocked,
++                                    l_desiredPage,
++                                    i_i2cInfo );
+ 
+-                        // break from retry loop
+-                        break;
+-                    }
++                if( err )
++                {
++                    TRACFCOMP(g_trac_eeprom,
++                            "Failed switching to EEPROM page 1 for second write op");
++                    break;
+                 }
+ 
+-            } // end of retry loop
+-            /***********************************************************/
++                // Perform the second write operation
++                err = eepromWriteData( i_target,
++                                       &reinterpret_cast<uint8_t*>(newBuffer)[l_writeBuflen],
++                                       l_bytesIntoSecondPage,
++                                       &byteAddr,
++                                       byteAddrSize,
++                                       i_i2cInfo );
+ 
+-            // Handle saved NACK errors, if any
+-            if (err_NACK)
+-            {
+-                if (err)
++                if( err ) 
+                 {
+-                    // commit original NACK error with new err PLID
+-                    err_NACK->plid(err->plid());
+-                    TRACFCOMP(g_trac_eeprom, "eepromWrite(): Committing saved "
+-                              "NACK err eid=0x%X with plid of returned err: "
+-                              "0x%X",
+-                              err_NACK->eid(), err_NACK->plid());
+-
+-                    ERRORLOG::ErrlUserDetailsTarget(i_target)
+-                                                    .addToLog(err_NACK);
+-
+-                    errlCommit(err_NACK, EEPROM_COMP_ID);
++                    TRACFCOMP( g_trac_eeprom,
++                            "Failed writing data: second eeprom write");
+                 }
+-                else
+-                {
+-                    // Since we eventually succeeded, delete original NACK error
+-                    TRACFCOMP(g_trac_eeprom, "eepromWrite(): Op successful, "
+-                              "deleting saved NACK err eid=0x%X, plid=0x%X",
+-                              err_NACK->eid(), err_NACK->plid());
+ 
+-                    delete err_NACK;
+-                    err_NACK = NULL;
+-                }
++                // Restore original offset
++                i_i2cInfo.offset = l_tempOffset;
+             }
+ 
+-            if ( err )
+-            {
+-                // Can't assume that anything was written if
+-                // there was an error, so no update to total_bytes_written
+-                // for this loop
+-                break;
+-            }
++
+ 
+             // Wait for EEPROM to write data to its internal memory
+             // i_i2cInfo.writeCycleTime value in milliseconds
+@@ -890,14 +1115,10 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+         mutex_unlock( &g_eepromMutex );
+         unlock = false;
+ 
++
+         // Set how much data was actually written
+         io_buflen = total_bytes_written;
+ 
+-        if( err )
+-        {
+-            // Leave do-while loop
+-            break;
+-        }
+ 
+         TRACSCOMP( g_trac_eepromr,
+                    "EEPROM WRITE END   : Chip: %02d : Offset %.2X : Len %d",
+@@ -916,6 +1137,30 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+         mutex_unlock( & g_eepromMutex );
+     }
+ 
++
++    // Whether we failed in the main routine or not, unlock the page iff it is already
++    // locked
++    if( l_pageLocked )
++    {
++        errlHndl_t l_pageOpErrl = NULL;
++
++        bool l_switchPage = false;
++        bool l_lockMutex = false;
++        l_pageOpErrl = eepromPageOp( i_target,
++                                     l_switchPage,
++                                     l_lockMutex,
++                                     l_pageLocked,
++                                     l_desiredPage,
++                                     i_i2cInfo );
++        if( l_pageOpErrl )
++        {
++            TRACFCOMP(g_trac_eeprom,
++                    "eepromWrite()::Failed unlocking page");
++            errlCommit(l_pageOpErrl, I2C_COMP_ID);
++        }
++
++    }
++
+     TRACDCOMP( g_trac_eeprom,
+                EXIT_MRK"eepromWrite()" );
+ 
+@@ -924,15 +1169,188 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+ } // end eepromWrite
+ 
+ 
++
++
++
++
++// ------------------------------------------------------------------
++// eepromWriteData
++// ------------------------------------------------------------------
++errlHndl_t eepromWriteData( TARGETING::Target * i_target,
++                            void * i_dataToWrite,
++                            size_t i_dataLen,
++                            void * i_byteAddress,
++                            size_t i_byteAddressSize,
++                            eeprom_addr_t i_i2cInfo )
++{
++    TRACDCOMP( g_trac_eeprom,
++               ENTER_MRK"eepromWriteData()");
++    errlHndl_t err = NULL;
++    errlHndl_t err_NACK = NULL;
++    do
++    {
++         /***********************************************************/
++         /* Attempt write multiple times ONLY on NACK fails         */
++         /***********************************************************/
++        for (uint8_t retry = 0;
++              retry <= EEPROM_MAX_NACK_RETRIES;
++              retry++)
++         {
++             // Do the actual data write
++             err = deviceOp( DeviceFW::WRITE,
++                             i_target,
++                             i_dataToWrite,
++                             i_dataLen,
++                             DEVICE_I2C_ADDRESS_OFFSET(
++                                            i_i2cInfo.port,
++                                            i_i2cInfo.engine,
++                                            i_i2cInfo.devAddr,
++                                            i_byteAddressSize,
++                                            reinterpret_cast<uint8_t*>(
++                                            i_byteAddress)));
++
++
++             if ( err == NULL )
++             {
++                 // Operation completed successfully
++                 // break from retry loop
++                 break;
++             }
++             else if ( err->reasonCode() != I2C::I2C_NACK_ONLY_FOUND )
++             {
++                 // Only retry on NACK failures: break from retry loop
++                 TRACFCOMP(g_trac_eeprom, ERR_MRK"eepromWriteData(): I2C "
++                           "Write Non-NACK fail %d/%d/0x%X, "
++                           "ldl=%d, offset=0x%X, aS=%d, retry=%d",
++                           i_i2cInfo.port, i_i2cInfo.engine,
++                           i_i2cInfo.devAddr, i_dataLen,
++                           i_i2cInfo.offset, i_i2cInfo.addrSize, retry);
++
++                 err->collectTrace(EEPROM_COMP_NAME);
++
++                 // break from retry loop
++                 break;
++             }
++             else // Handle NACK error
++             {
++                 TRACFCOMP(g_trac_eeprom, ERR_MRK"eepromWriteData(): I2C "
++                           "Write NACK fail %d/%d/0x%X, "
++                           "ldl=%d, offset=0x%X, aS=%d, writePageSize = %x",
++                           i_i2cInfo.port, i_i2cInfo.engine,
++                           i_i2cInfo.devAddr, i_dataLen,
++                           i_i2cInfo.offset, i_i2cInfo.addrSize,
++                           i_i2cInfo.writePageSize);
++
++                 // If op will be attempted again: save error and continue
++                 if ( retry < EEPROM_MAX_NACK_RETRIES )
++                 {
++                     // Only save original NACK error
++                     if ( err_NACK == NULL )
++                     {
++                         // Save original NACK error
++                         err_NACK = err;
++
++                         TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromWriteData(): "
++                                    "Error rc=0x%X, eid=0x%X plid=0x%X, "
++                                    "tgt=0x%X, retry/MAX=%d/%d. Save error "
++                                    "and retry",
++                                    err_NACK->reasonCode(),
++                                    err_NACK->eid(),
++                                    err_NACK->plid(),
++                                    TARGETING::get_huid(i_target),
++                                    retry, EEPROM_MAX_NACK_RETRIES);
++
++                         err_NACK->collectTrace(EEPROM_COMP_NAME);
++                     }
++                     else
++                     {
++                         // Add data to original NACK error
++                         TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromWriteData(): "
++                                    "Another NACK Error rc=0x%X, eid=0x%X "
++                                    "plid=0x%X, tgt=0x%X, retry/MAX=%d/%d. "
++                                    "Delete error and retry",
++                                    err->reasonCode(), err->eid(),
++                                    err->plid(),
++                                    TARGETING::get_huid(i_target),
++                                    retry, EEPROM_MAX_NACK_RETRIES);
++
++                         ERRORLOG::ErrlUserDetailsString(
++                                   "Another NACK ERROR found")
++                                   .addToLog(err_NACK);
++
++                         // Delete this new NACK error
++                         delete err;
++                         err = NULL;
++                     }
++
++                     // continue to retry
++                     continue;
++                 }
++                 else // no more retries: trace and break
++                 {
++                     TRACFCOMP( g_trac_eeprom, ERR_MRK"eepromWriteData(): "
++                                "Error rc=0x%X, tgt=0x%X. No More Retries "
++                                "(retry/MAX=%d/%d). Returning Error",
++                                err->reasonCode(),
++                                TARGETING::get_huid(i_target),
++                                retry, EEPROM_MAX_NACK_RETRIES);
++
++                     err->collectTrace(EEPROM_COMP_NAME);
++
++                     // break from retry loop
++                     break;
++                 }
++             }
++
++         } // end of retry loop
++         /***********************************************************/
++
++         // Handle saved NACK errors, if any
++         if (err_NACK)
++         {
++             if (err)
++             {
++                 // commit original NACK error with new err PLID
++                 err_NACK->plid(err->plid());
++                 TRACFCOMP(g_trac_eeprom, "eepromWriteData(): Committing saved "
++                           "NACK err eid=0x%X with plid of returned err: "
++                           "0x%X",
++                           err_NACK->eid(), err_NACK->plid());
++
++                 ERRORLOG::ErrlUserDetailsTarget(i_target)
++                                                 .addToLog(err_NACK);
++
++                 errlCommit(err_NACK, EEPROM_COMP_ID);
++             }
++             else
++             {
++                 // Since we eventually succeeded, delete original NACK error
++                 TRACFCOMP(g_trac_eeprom, "eepromWriteData(): Op successful, "
++                           "deleting saved NACK err eid=0x%X, plid=0x%X",
++                           err_NACK->eid(), err_NACK->plid());
++
++                 delete err_NACK;
++                 err_NACK = NULL;
++             }
++         }
++    }while( 0 );
++    TRACDCOMP( g_trac_eeprom,
++            EXIT_MRK"eepromWriteData()");
++    return err;
++}
++
++
++
+ // ------------------------------------------------------------------
+ // eepromPrepareAddress
+ // ------------------------------------------------------------------
+-errlHndl_t eepromPrepareAddress ( void * io_buffer,
++errlHndl_t eepromPrepareAddress ( TARGETING::Target * i_target,
++                                  void * io_buffer,
+                                   size_t & o_bufSize,
++                                  uint8_t & o_desiredPage,
+                                   eeprom_addr_t i_i2cInfo )
+ {
+     errlHndl_t err = NULL;
+-
+     o_bufSize = 0;
+ 
+     TRACDCOMP( g_trac_eeprom,
+@@ -954,6 +1372,21 @@ errlHndl_t eepromPrepareAddress ( void * io_buffer,
+                 *((uint8_t*)io_buffer+1) = (i_i2cInfo.offset & 0x00FFull);
+                 break;
+ 
++            case ONE_BYTE_ADDR_PAGESELECT:
++                // If the offset is less than 256 bytes, report page zero, else page 1
++                if( i_i2cInfo.offset >= EEPROM_PAGE_SIZE )
++                {
++                    o_desiredPage = 1;
++                }
++                else
++                {
++                    o_desiredPage = 0;
++                }
++                o_bufSize = 1;
++                memset( io_buffer, 0x0, o_bufSize );
++                *((uint8_t*)io_buffer) = (i_i2cInfo.offset & 0xFFull);
++                break;
++
+             case ONE_BYTE_ADDR:
+                 o_bufSize = 1;
+                 memset( io_buffer, 0x0, o_bufSize );
+@@ -1058,7 +1491,6 @@ errlHndl_t eepromReadAttributes ( TARGETING::Target * i_target,
+                 break;
+ 
+             case SBE_BACKUP:
+-
+                 if( (!i_target->
+                         tryGetAttr<TARGETING::ATTR_EEPROM_SBE_BACKUP_INFO>
+                         ( reinterpret_cast<
+@@ -1147,7 +1579,7 @@ errlHndl_t eepromReadAttributes ( TARGETING::Target * i_target,
+         }
+         else if ( eepromData.byteAddrOffset == 0x1 )
+         {
+-            o_i2cInfo.addrSize = ONE_BYTE_ADDR;
++            o_i2cInfo.addrSize = ONE_BYTE_ADDR_PAGESELECT;
+         }
+         else if ( eepromData.byteAddrOffset == 0x0 )
+         {
+diff --git a/src/usr/i2c/eepromdd.H b/src/usr/i2c/eepromdd.H
+index 234be5e..b425ccf 100755
+--- a/src/usr/i2c/eepromdd.H
++++ b/src/usr/i2c/eepromdd.H
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2011,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2011,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -46,9 +46,10 @@ namespace EEPROM
+ */
+ typedef enum
+ {
+-    ZERO_BYTE_ADDR  = 0,
+-    ONE_BYTE_ADDR   = 1,
+-    TWO_BYTE_ADDR   = 2,
++    ZERO_BYTE_ADDR             = 0,
++    ONE_BYTE_ADDR_PAGESELECT   = 1,  // page select
++    ONE_BYTE_ADDR              = 2,
++    TWO_BYTE_ADDR              = 3,
+     LAST_DEVICE_TYPE
+ } eeprom_addr_size_t;
+ 
+@@ -70,6 +71,14 @@ typedef struct
+     uint64_t writeCycleTime;  // in milliseconds
+ } eeprom_addr_t;
+ 
++/*
++ * @brief Miscellaneous enums for EEPROM
++ */
++enum
++{
++    EEPROM_PAGE_SIZE = 0x100
++};
++
+ /**
+ *
+ * @brief Perform an EEPROM access operation.
+@@ -109,6 +118,57 @@ errlHndl_t eepromPerformOp( DeviceFW::OperationType i_opType,
+                             va_list i_args );
+ 
+ /**
++ *
++ * @brief Perform operations to lock and unlock the page mutex
++ *
++ * @param[in] i_target - the target to lock the page for
++ * @param[in] i_switchPage - bool to tell the function whether we are
++ *      trying to switch pages/locking vs unlocking the page
++ * @param[in] i_lockMutex - bool to inform call chain whether we want
++ *              to actually lock the page mutex or not. When false,
++ *              the function assumes the appropriate mutex has already
++ *              been locked and skips the call to mutex_lock
++ * @param[in/out] i_pageLocked - bool to tell the caller if the page
++ *      was successfully locked.
++ * @param[in] i_desiredPage - The page we want to switch to
++ * @param[in] i_args - This is an argument list for the device driver
++ *      framework.  This argument list consists of the chip number of
++ *      the EEPROM to access from the given I2C Master target and the
++ *      internal offset to use on the slave I2C device.
++ *
++ * @return errlHndl_t - NULL if successful, otherwise a pointer to the
++ *      error log.
++ */
++errlHndl_t eepromPageOp( TARGETING::Target * i_target,
++                         bool i_switchPage,
++                         bool i_lockMutex,
++                         bool & io_pageLocked,
++                         uint8_t i_desiredPage,
++                         eeprom_addr_t i_i2cInfo );
++
++
++/*
++ * @brief This utility function determines if a read/write straddles
++ *        the boundary between EEPROM pages and if so, returns the
++ *        parameters to perform 2 operations, one for each page.
++ *
++ * @param[in] i_originalOffset - The requested read/write offset into
++ *          the EEPROM.
++ * @param[in] i_originalLen - The requested length of the data.
++ * @param[in/out] io_newLen - The length of the data to retrieve
++ * @param[out] o_pageTwoBuflen - The length of data requested that
++ *          crossed over into the second EEPROM page.
++ *
++ * @return bool - True if the requested data straddles the EEPROM page
++ *          boundary, False otherwise. If False, io_newLen == i_originalLen.
++ */
++bool crossesEeepromPageBoundary( uint64_t i_originalOffset,
++                                 size_t i_originalLen,
++                                 size_t & io_newLen,
++                                 size_t & o_pageTwoBuflen );
++
++
++/**
+  * @brief This function peforms the sequencing to do a read of the
+  *      EEPROM that is identified.
+  *
+@@ -130,6 +190,37 @@ errlHndl_t eepromRead ( TARGETING::Target * i_target,
+                         size_t i_buflen,
+                         eeprom_addr_t i_i2cInfo );
+ 
++
++/**
++ * @brief This function actually performs the i2c operations to read data from
++ *        the EEPROM
++ *
++ * @param[in] i_target - Target device
++ *
++ * @param[out] o_buffer - the buffer that will return the data read from
++ *                    the eeprom device
++ *
++ * @param[in] i_buflen - Number of bytes read from the EEPROM device
++ *
++ * @param[in] i_byteAddress - the offset into the EEPROM device
++ *
++ * @param[in] i_byteAddressSize - the size of the byte address (1 or 2 bytes)
++ *
++ * @param[in] i_i2cInfo - Structure of I2C parameters needed to execute the
++ *      command to the I2C device driver
++ *
++ * @return errlHndl_t - NULL if successful, otherwise a pointer to the
++ *       error log.
++ */
++errlHndl_t eepromReadData( TARGETING::Target * i_target,
++                           void * o_buffer,
++                           size_t i_buflen,
++                           void * i_byteAddress,
++                           size_t i_byteAddressSize,
++                           eeprom_addr_t i_i2cInfo );
++
++
++
+ /**
+  * @brief This function peforms the sequencing to do a write of the
+  *      EEPROM that is identified.
+@@ -155,25 +246,52 @@ errlHndl_t eepromWrite ( TARGETING::Target * i_target,
+                          size_t & io_buflen,
+                          eeprom_addr_t i_i2cInfo );
+ 
++
++
++/**
++ * @brief This function actually writes data into the devices EEPROM
++ *
++ * @param[in] i_target - Target device.
++ * @param[in] i_dataToWrite - The data to be written into the device.
++ * @param[in] i_dataLen - The length of the data to be written.
++ * @param[in] i_byteAddress - the offset into the devices EEPROM.
++ * @param[in] i_byteAddressSize - the size of byte address varable.
++ * @param[in] i_i2cInfo - Structure of I2C parameters needed to execute
++ *      the command to the I2C device driver.
++ */
++errlHndl_t eepromWriteData( TARGETING::Target * i_target,
++                            void * i_dataToWrite,
++                            size_t i_dataLen,
++                            void * i_byteAddress,
++                            size_t i_byteAddressSize,
++                            eeprom_addr_t i_i2cInfo );
++
++
+ /**
+  * @brief This function prepares the I2C byte address for adding to the
+  *      existing buffer (for Writes), or as a separate write operation
+  *      (for Reads).
+  *
++ * @param[in] i_target - the target to prepare the addressing for.
++ *
+  * @param[in/out] io_buffer - The buffer to be written as a byte address to
+  *      the EEPROM device.  Must be pre-allocated to MAX_BYTE_ADDR size.
+  *
+  * @param[out] o_bufSize - The size of the buffer to be written.
+  *
++ * @param[out] o_desiredPage - The page we want to switch to.
++ *
+  * @param[in] i_i2cInfo - Structure of I2C parameters needed to execute
+  *      the command to the I2C device driver.
+  *
+  * @return errlHndl_t - NULL if successful, otherwise a pointer to the
+  *      error log.
+  */
+-errlHndl_t eepromPrepareAddress ( void * io_buffer,
++errlHndl_t eepromPrepareAddress ( TARGETING::Target * i_target,
++                                  void * io_buffer,
+                                   size_t & o_bufSize,
+-                                  eeprom_addr_t i_i2cInfo );
++                                  uint8_t & o_desiredPage,
++                                  eeprom_addr_t i_i2cInfo);
+ 
+ /**
+  * @brief this function will read all of the associated attributes needed
+diff --git a/src/usr/i2c/i2c.C b/src/usr/i2c/i2c.C
+index e88504f..a78a86d 100755
+--- a/src/usr/i2c/i2c.C
++++ b/src/usr/i2c/i2c.C
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2011,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2011,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -76,6 +76,8 @@ TRAC_INIT( & g_trac_i2cr, "I2CR", KILOBYTE );
+ #define P8_MASTER_ENGINES 2         // Number of Engines used in P8
+ #define P8_MASTER_PORTS 3           // Number of Ports used in P8
+ #define CENTAUR_MASTER_ENGINES 1    // Number of Engines in a Centaur
++#define MAX_NACK_RETRIES 3
++#define PAGE_SELECT_OP 0xff         // Special value used to determin type of Op
+ 
+ // Derived from ATTR_I2C_BUS_SPEED_ARRAY[engine][port] attribute
+ const TARGETING::ATTR_I2C_BUS_SPEED_ARRAY_type g_var = {{NULL}};
+@@ -123,13 +125,6 @@ errlHndl_t i2cPerformOp( DeviceFW::OperationType i_opType,
+     // These are additional parms in the case an offset is passed in
+     // via va_list, as well
+ 
+-    args.offset_length = va_arg( i_args, uint64_t);
+-
+-    if ( args.offset_length != 0 )
+-    {
+-        args.offset_buffer = reinterpret_cast<uint8_t*>
+-                                             (va_arg(i_args, uint64_t));
+-    }
+ 
+     // Set both Host and FSI switches to 0 so that they get set later by
+     // attribute in i2cCommonOp()
+@@ -137,16 +132,72 @@ errlHndl_t i2cPerformOp( DeviceFW::OperationType i_opType,
+     args.switches.useFsiI2C  = 0;
+ 
+ 
+-    // Call common function
+-    err = i2cCommonOp( i_opType,
+-                       i_target,
+-                       io_buffer,
+-                       io_buflen,
+-                       i_accessType,
+-                       args );
++    // Decide if page select was requested (denoted with special device address)
++    if( args.devAddr == PAGE_OPERATION )
++    {
+ 
++        // since this was a page operation, next arg will be whether we want to
++        // lock the page, or unlock
++        bool l_lockOp = static_cast<bool>(va_arg(i_args, int));
++        if(l_lockOp)
++        {
++            //If page select requested, desired page would be passed in va_list
++            uint8_t l_desiredPage = static_cast<uint8_t>(va_arg(i_args, int ));
+ 
+-    TRACDCOMP( g_trac_i2c,
++            bool l_lockMutex = static_cast<bool>(va_arg(i_args, int));
++            err = i2cPageSwitchOp( i_opType,
++                                    i_target,
++                                    i_accessType,
++                                    l_desiredPage,
++                                    l_lockMutex,
++                                    args );
++
++
++            if( err )
++            {
++                TRACFCOMP(g_trac_i2c, "Locking the page FAILED");
++                bool l_pageUnlockSuccess = false;
++                l_pageUnlockSuccess = i2cPageUnlockOp( i_target,
++                                                    args );
++                if( !l_pageUnlockSuccess )
++                {
++                    TRACFCOMP(g_trac_i2c,
++                        "An Error occurred when unlocking page after"
++                        " failure to lock the page!");
++                }
++            }
++        }
++        else
++        {
++            bool l_pageUnlockSuccess;
++            l_pageUnlockSuccess = i2cPageUnlockOp( i_target,
++                                                   args );
++            if( !l_pageUnlockSuccess )
++            {
++                TRACFCOMP(g_trac_i2c,"i2cPerformOp::i2cPageUnlockOp - FAILURE UNLOCKING THE PAGE");
++            }
++        }
++
++    }
++    else
++    {
++        args.offset_length = va_arg( i_args, uint64_t);
++        if ( args.offset_length != 0 )
++        {
++            args.offset_buffer = reinterpret_cast<uint8_t*>
++                                                 (va_arg(i_args, uint64_t));
++        }
++            // Else, call the normal common function
++            err = i2cCommonOp( i_opType,
++                               i_target,
++                               io_buffer,
++                               io_buflen,
++                               i_accessType,
++                               args );
++    }
++
++
++    TRACUCOMP( g_trac_i2c,
+                EXIT_MRK"i2cPerformOp() - %s",
+                ((NULL == err) ? "No Error" : "With Error") );
+ 
+@@ -283,6 +334,368 @@ errlHndl_t fsi_i2cPerformOp( DeviceFW::OperationType i_opType,
+     return err;
+ } // end fsi_i2cPerformOp
+ 
++
++// ------------------------------------------------------------------
++// i2cHandleError
++// ------------------------------------------------------------------
++void i2cHandleError( TARGETING::Target * i_target,
++                     errlHndl_t & i_err,
++                     misc_args_t & i_args )
++{
++    errlHndl_t err_reset = NULL;
++    TRACUCOMP(g_trac_i2c, ENTER_MRK"i2cHandlError()");
++    if( i_err )
++    {
++        // if it was a bus arbition lost error set the
++        // the reset level so a force unlock reset can be performed
++        i2c_reset_level l_reset_level = BASIC_RESET;
++
++        if ( i_err->reasonCode() == I2C_ARBITRATION_LOST_ONLY_FOUND )
++        {
++
++            l_reset_level = FORCE_UNLOCK_RESET;
++        }
++
++        // Reset the I2C Master
++        err_reset = i2cReset( i_target,
++                              i_args,
++                              l_reset_level);
++
++        if( err_reset )
++        {
++            // 2 error logs, so commit the reset log here
++            TRACFCOMP( g_trac_i2c, ERR_MRK"i2cCommonOp() - "
++                    "Previous error (rc=0x%X, eid=0x%X) before "
++                    "i2cReset() failed.  Committing reset error "
++                    "(rc=0x%X, eid=0x%X) and returning original error",
++                    i_err->reasonCode(), i_err->eid(),
++                    err_reset->reasonCode(), err_reset->eid() );
++
++            errlCommit( err_reset, I2C_COMP_ID );
++
++       }
++
++        // Sleep to allow devices to recover from reset
++        nanosleep( 0, I2C_RESET_DELAY_NS );
++
++    }
++    TRACUCOMP(g_trac_i2c, EXIT_MRK"i2cHandlError()");
++}
++
++// ------------------------------------------------------------------
++// i2cPageSwitchOp
++// ------------------------------------------------------------------
++errlHndl_t i2cPageSwitchOp( DeviceFW::OperationType i_opType,
++                             TARGETING::Target * i_target,
++                             int64_t i_accessType,
++                             uint8_t i_desiredPage,
++                             bool i_lockMutex,
++                             misc_args_t & i_args )
++{
++    TRACUCOMP(g_trac_i2c, ENTER_MRK"i2cPageSwitchOp");
++
++    errlHndl_t l_err = NULL;
++    errlHndl_t l_err_NACK = NULL;
++    bool l_mutexSuccess = false;
++    bool l_pageSwitchNeeded = false;
++    bool l_mutex_needs_unlock = false;
++
++    bool l_error = false;
++    mutex_t * l_pageLock = NULL;
++    //TODO Used for saving the eeprom page
++//    TARGETING::ATTR_EEPROM_PAGE_type l_currentPage;
++//    TARGETING::ATTR_EEPROM_PAGE_type l_newPage;
++
++    do
++    {
++
++        // Check for Master Sentinel chip
++        if( TARGETING::MASTER_PROCESSOR_CHIP_TARGET_SENTINEL == i_target )
++        {
++            TRACFCOMP( g_trac_i2c,
++                       ERR_MRK"i2cPageSwitchOp() - Cannot target Master Sentinel "
++                       "Chip for an I2C Operation!" );
++
++            /*@
++             * @errortype
++             * @reasoncode     I2C_MASTER_SENTINEL_TARGET
++             * @severity       ERRORLOG_SEV_UNRECOVERABLE
++             * @moduleid       I2C_PAGE_LOCK_OP
++             * @userdata1      Operation Type requested
++             * @userdata2      <UNUSED>
++             * @devdesc        Master Sentinel chip was used as a target for an
++             *                 I2C operation.  This is not permitted.
++             */
++            l_err = new ERRORLOG::ErrlEntry( ERRORLOG::ERRL_SEV_UNRECOVERABLE,
++                                           I2C_PERFORM_OP,
++                                           I2C_MASTER_SENTINEL_TARGET,
++                                           i_opType,
++                                           0x0,
++                                           true /*Add HB SW Callout*/ );
++
++            l_err->collectTrace( I2C_COMP_NAME, 256);
++
++            break;
++        }
++
++        //Set Host vs Fsi switches if not done already
++        i2cSetSwitches(i_target, i_args);
++
++
++
++        if(i_lockMutex)
++        {
++            //get page mutex
++            l_mutexSuccess = i2cGetPageMutex(i_target,
++                                           i_args,
++                                           l_pageLock );
++            if(!l_mutexSuccess)
++            {
++                TRACUCOMP(g_trac_i2c,
++                          ERR_MRK"Error in i2cPageSwitchOp::i2cGetPageMutex()");
++                /*@
++                 * @errortype
++                 * @reasoncode     I2C_INVALID_EEPROM_PAGE_MUTEX
++                 * @severity       ERRORLOG_SEV_UNRECOVERABLE
++                 * @moduleid       I2C_PAGE_LOCK_OP
++                 * @userdata1      Target Huid
++                 * @userdata2      <UNUSED>
++                 * @devdesc        There was an error retrieving the EEPROM page
++                 *                 mutex for this i2c master engine
++                 */
++                l_err = new ERRORLOG::ErrlEntry( ERRORLOG::ERRL_SEV_UNRECOVERABLE,
++                                                 I2C_PERFORM_OP,
++                                                 I2C_INVALID_EEPROM_PAGE_MUTEX,
++                                                 TARGETING::get_huid(i_target),
++                                                 0x0,
++                                                 true /*Add HB SW Callout*/ );
++
++                l_err->collectTrace( I2C_COMP_NAME, 256 );
++                break;
++            }
++
++            (void)mutex_lock( l_pageLock );
++        }
++        // Calculate variables related to I2C Bus speed in 'args' struct
++        l_err = i2cSetBusVariables( i_target, I2C_BUS_SPEED_FROM_MRW, i_args);
++
++        if( l_err )
++        {
++            TRACFCOMP(g_trac_i2c,
++                    "Error in i2cPageSwitchOp::i2cSetBusVariables()");
++
++            // Error means we need to unlock the page mutex prematurely
++            l_mutex_needs_unlock = true;
++            // Skip performing actual I2C Operation
++            break;
++        }
++
++
++        // Set device address to switch to appropriate page
++        if( i_desiredPage == PAGE_ONE )
++        {
++            i_args.devAddr = PAGE_ONE_ADDR;
++        }
++        else if( i_desiredPage == PAGE_ZERO )
++        {
++            i_args.devAddr = PAGE_ZERO_ADDR;
++        }
++        l_pageSwitchNeeded = true;
++
++        //TODO optimize to remember current page of i2c master device
++
++        if( l_pageSwitchNeeded )
++        {
++            // Perform the actual write operation to switch pages.
++            i_args.read_not_write  = false;
++            i_args.with_stop       = true;
++            i_args.skip_mode_setup = false;
++
++
++            //going to write 2 bytes of zeros to special device address
++            size_t l_zeroBuflen = 2;
++            uint8_t * l_zeroBuffer = static_cast<uint8_t*>(malloc(l_zeroBuflen));
++            memset(l_zeroBuffer, 0, l_zeroBuflen);
++
++
++            TRACUCOMP(g_trac_i2c,"i2cPageSwitchOp args! \n"
++                    "misc_args_t: port:%d / engine: %d: devAddr: %x: skip_mode_step(%d):\n"
++                    "with_stop(%d): read_not_write(%d): bus_speed: %d: bit_rate_divisor: %d:\n"
++                    "polling_interval_ns: %d: timeout_count: %d: offset_length: %d",
++                    i_args.port, i_args.engine, i_args.devAddr, i_args.skip_mode_setup,
++                    i_args.with_stop, i_args.read_not_write, i_args.bus_speed,
++                    i_args.bit_rate_divisor, i_args.polling_interval_ns, i_args.timeout_count,
++                    i_args.offset_length );
++
++
++            // Retry MAX_NACK_RETRIES so we can bypass nacks caused by a busy bus.
++            // Other Nack errors are expected and caused by the empty write
++            // associated with the page switch operation.
++            for(uint8_t retry = 0;
++                retry <= MAX_NACK_RETRIES;
++                retry++)
++            {
++                l_err = i2cWrite(i_target,
++                                 l_zeroBuffer,
++                                 l_zeroBuflen,
++                                 i_args);
++
++                if(l_err == NULL)
++                {
++                    // Operation completed successfully
++                    // set attribute, free memory and break from retry loop
++                    // TODO Set EEPROM_PAGE attribute to save page for
++                    // optimization
++                    TRACUCOMP(g_trac_i2c,"Set EEPROM_PAGE to %d", i_desiredPage);
++                    // i_target->setAttr<TARGETING::ATTR_EEPROM_PAGE>(l_newPage);
++                    free(l_zeroBuffer);
++                    break;
++                }
++                else if( l_err->reasonCode() != I2C_NACK_ONLY_FOUND)
++                {
++                    // Only retry on NACK failures. Break form retry loop
++                    TRACFCOMP(g_trac_i2c,
++                            ERR_MRK"i2cPageSwitchOp(): I2C Write "
++                            "Non-NACK fail %x", i_args.devAddr );
++                    l_err->collectTrace(I2C_COMP_NAME);
++                    l_mutex_needs_unlock = true;
++                    l_error = true;
++                    break;
++                }
++                else // Handle NACK error
++                {
++                    TRACFCOMP(g_trac_i2c,
++                       "i2cPageSwitchOp::Expected Nack error. Retrying in case "
++                       "this nack was caused by bus being busy "
++                       "loop = %d", retry);
++
++                    nanosleep( 0, i_args.polling_interval_ns );
++
++                    // Retry on NACKs just in case the cause was a busy i2c bus.
++                    if( retry < MAX_NACK_RETRIES )
++                    {
++                        if(l_err_NACK == NULL)
++                        {
++                            l_err_NACK = l_err;
++                          //  TRACFCOMP(g_trac_i2c,
++                            //        "Saving first Nack error and retry");
++                            nanosleep(0, i_args.polling_interval_ns);
++                            l_err_NACK->collectTrace(I2C_COMP_NAME);
++
++                        }
++                        else
++                        {
++                            // Delete this new NACK error
++                            delete l_err;
++                            nanosleep(0 ,i_args.polling_interval_ns);
++                            l_err = NULL;
++                        }
++                        // continue to retry
++                        continue;
++                    }
++                    else // no more retries: trace and break;
++                    {
++                        TRACFCOMP(g_trac_i2c,
++                                "Exiting Nack retry loop");
++                        break;
++
++                    }
++                }
++
++            } // end of retry loop
++
++            if(l_err_NACK)
++            {
++                if( l_err )
++                {
++                    i2cHandleError( i_target,
++                                    l_err,
++                                    i_args );
++                    delete l_err;
++                    l_err = NULL;
++
++                }
++                delete l_err_NACK;
++                l_err_NACK = NULL;
++            }
++        }
++
++        if( l_error )
++        {
++           //call i2cHandleError
++           i2cHandleError( i_target,
++                           l_err,
++                           i_args );
++           break;
++        }
++    }while( 0 );
++    if( l_mutex_needs_unlock )
++    {
++        TRACFCOMP(g_trac_i2c,
++                "Prematurely unlocking page mutex");
++        (void)mutex_unlock(l_pageLock);
++    }
++
++    TRACUCOMP(g_trac_i2c, EXIT_MRK"i2cPageSwitchOp()");
++
++    return l_err;
++}
++
++
++
++// ------------------------------------------------------------------
++// i2cPageUnlockOp
++// ------------------------------------------------------------------
++bool i2cPageUnlockOp( TARGETING::Target * i_target,
++                            misc_args_t & i_args )
++{
++    TRACUCOMP(g_trac_i2c, ENTER_MRK"i2cPageUnlockOp()");
++    bool l_mutexSuccess = false;
++    mutex_t * l_pageLock = NULL;
++    errlHndl_t l_err = NULL;
++
++    do
++    {
++        // Get the mutex for this target
++        l_mutexSuccess = i2cGetPageMutex( i_target,
++                                          i_args,
++                                          l_pageLock );
++
++        if( !l_mutexSuccess )
++        {
++            TRACUCOMP( g_trac_i2c,
++                   ERR_MRK"Error in i2cPageUnlockOp::i2cGetPageMutex()");
++            /*@
++             * @errortype
++             * @reasoncode     I2C_INVALID_EEPROM_PAGE_MUTEX
++             * @severity       ERRORLOG_SEV_UNRECOVERABLE
++             * @moduleid       I2C_PAGE_UNLOCK_OP
++             * @userdata1      Target Huid
++             * @userdata2      <UNUSED>
++             * @devdesc        There was an error retrieving the EEPROM page
++             *                 mutex for this i2c master engine
++             */
++            l_err = new ERRORLOG::ErrlEntry( ERRORLOG::ERRL_SEV_UNRECOVERABLE,
++                                             I2C_PERFORM_OP,
++                                             I2C_INVALID_EEPROM_PAGE_MUTEX,
++                                             TARGETING::get_huid(i_target),
++                                             0x0,
++                                             true /*Add HB SW Callout*/ );
++
++            l_err->collectTrace( I2C_COMP_NAME, 256 );
++            errlCommit(l_err, I2C_COMP_ID);
++            break;
++        }
++        //Unlock the page mutex
++        (void)mutex_unlock(l_pageLock);
++    }while( 0 );
++
++    TRACUCOMP(g_trac_i2c, EXIT_MRK"i2cPageUnlockOp()");
++    return l_mutexSuccess;
++}
++
++
++
+ // ------------------------------------------------------------------
+ // i2cSetSwitches
+ // ------------------------------------------------------------------
+@@ -316,22 +729,14 @@ errlHndl_t i2cCommonOp( DeviceFW::OperationType i_opType,
+                         misc_args_t & i_args )
+ {
+     errlHndl_t err = NULL;
+-    errlHndl_t err_reset = NULL;
+     bool mutex_success = false;
+ 
+     mutex_t * engineLock = NULL;
+     bool mutex_needs_unlock = false;
+ 
+-    TRACDCOMP( g_trac_i2c,
+-               ENTER_MRK"i2cCommonOp(): i_opType=%d, aType=%d, "
+-               "p/e/devAddr= %d/%d/0x%X, len=%d, offset=%d/%p",
+-               (uint64_t) i_opType, i_accessType, i_args.port, i_args.engine,
+-               i_args.devAddr, io_buflen, i_args.offset_length,
+-               i_args.offset_buffer);
+-
+     TRACUCOMP( g_trac_i2c,
+                ENTER_MRK"i2cCommonOp(): i_opType=%d, aType=%d, "
+-               "p/e/devAddr= %d/%d/0x%x, len=%d, offset=%d/%p",
++               "p/e/devAddr= %d/%d/0x%x, len=%d, offset=%x/%p",
+                (uint64_t) i_opType, i_accessType, i_args.port, i_args.engine,
+                i_args.devAddr, io_buflen, i_args.offset_length,
+                i_args.offset_buffer);
+@@ -370,6 +775,7 @@ errlHndl_t i2cCommonOp( DeviceFW::OperationType i_opType,
+         //Set Host vs Fsi switches if not done already
+         i2cSetSwitches(i_target, i_args);
+ 
++
+         // Get the mutex for the requested engine
+         mutex_success = i2cGetEngineMutex( i_target,
+                                        i_args,
+@@ -383,14 +789,8 @@ errlHndl_t i2cCommonOp( DeviceFW::OperationType i_opType,
+         }
+ 
+         // Lock on this engine
+-        TRACUCOMP( g_trac_i2c,
+-                   INFO_MRK"Obtaining lock for engine: %d",
+-                   i_args.engine );
+         (void)mutex_lock( engineLock );
+         mutex_needs_unlock = true;
+-        TRACUCOMP( g_trac_i2c,
+-                   INFO_MRK"Locked on engine: %d",
+-                   i_args.engine );
+ 
+ 
+         // Calculate variables related to I2C Bus Speed in 'args' struct
+@@ -413,7 +813,6 @@ errlHndl_t i2cCommonOp( DeviceFW::OperationType i_opType,
+         if( i_opType        == DeviceFW::READ &&
+             i_args.offset_length != 0 )
+         {
+-
+             // First WRITE offset to device without a stop
+             i_args.read_not_write  = false;
+             i_args.with_stop       = false;
+@@ -447,7 +846,6 @@ errlHndl_t i2cCommonOp( DeviceFW::OperationType i_opType,
+         else if( i_opType        == DeviceFW::WRITE &&
+                  i_args.offset_length != 0 )
+         {
+-
+             // Add the Offset Information to the start of the data and
+             // then send as a single write operation
+ 
+@@ -552,37 +950,9 @@ errlHndl_t i2cCommonOp( DeviceFW::OperationType i_opType,
+         // Handle Error from I2C Operation
+         if( err )
+         {
+-
+-            // if it was a bus arbition lost error set the
+-            // the reset level so a force unlock reset can be performed
+-            i2c_reset_level l_reset_level = BASIC_RESET;
+-
+-            if ( err->reasonCode() == I2C_ARBITRATION_LOST_ONLY_FOUND )
+-            {
+-                l_reset_level = FORCE_UNLOCK_RESET;
+-            }
+-
+-            // Reset the I2C Master
+-            err_reset = i2cReset( i_target,
+-                                  i_args,
+-                                  l_reset_level);
+-
+-            if( err_reset )
+-            {
+-                // 2 error logs, so commit the reset log here
+-                TRACFCOMP( g_trac_i2c, ERR_MRK"i2cCommonOp() - "
+-                           "Previous error (rc=0x%X, eid=0x%X) before "
+-                           "i2cReset() failed.  Committing reset error "
+-                           "(rc=0x%X, eid=0x%X) and returning original error",
+-                           err->reasonCode(), err->eid(),
+-                           err_reset->reasonCode(), err_reset->eid() );
+-
+-                errlCommit( err_reset, I2C_COMP_ID );
+-            }
+-
+-            // Sleep to allow devices to recover from reset
+-            nanosleep( 0, I2C_RESET_DELAY_NS );
+-
++            i2cHandleError( i_target,
++                            err,
++                            i_args );
+             break;
+         }
+ 
+@@ -1066,7 +1436,7 @@ errlHndl_t i2cWrite ( TARGETING::Target * i_target,
+     // Define regs we'll be using
+     fifo_reg_t fifo;
+ 
+-    TRACDCOMP( g_trac_i2c,
++    TRACUCOMP( g_trac_i2c,
+                ENTER_MRK"i2cWrite()" );
+ 
+     TRACSCOMP( g_trac_i2cr,
+@@ -1113,7 +1483,7 @@ errlHndl_t i2cWrite ( TARGETING::Target * i_target,
+                 break;
+             }
+ 
+-            TRACUCOMP( g_trac_i2cr,
++            TRACSCOMP( g_trac_i2cr,
+                        "I2C WRITE DATA  : engine %.2X : port %.2X : "
+                        "devAddr %.2X : byte %d : %.2X (0x%lx)",
+                        i_args.engine, i_args.port, i_args.devAddr,
+@@ -1142,7 +1512,7 @@ errlHndl_t i2cWrite ( TARGETING::Target * i_target,
+                "I2C WRITE END   : engine %.2X: port %.2X : devAddr %.2X : len %d",
+                i_args.engine, i_args.port, i_args.devAddr, io_buflen );
+ 
+-    TRACDCOMP( g_trac_i2c,
++    TRACUCOMP( g_trac_i2c,
+                EXIT_MRK"i2cWrite()" );
+ 
+     return err;
+@@ -1276,7 +1646,7 @@ bool i2cGetEngineMutex( TARGETING::Target * i_target,
+ 
+             default:
+                 TRACFCOMP( g_trac_i2c,
+-                           ERR_MRK"Invalid engine for getting Mutex! "
++                           ERR_MRK"i2cGetEngineMutex: Invalid engine for getting Mutex! "
+                            "i_args.engine=%d", i_args.engine );
+                 success = false;
+                 assert(false, "i2c.C: Invalid engine for getting Mutex!"
+@@ -1290,6 +1660,47 @@ bool i2cGetEngineMutex( TARGETING::Target * i_target,
+     return success;
+ }
+ 
++// ------------------------------------------------------------------
++// i2cGetPageMutex
++// ------------------------------------------------------------------
++bool i2cGetPageMutex( TARGETING::Target * i_target,
++                      misc_args_t & i_args,
++                      mutex_t *& i_pageLock )
++{
++    bool success = true;
++    do
++    {
++        switch( i_args.engine )
++        {
++            case 0:
++                i_pageLock = i_target->
++                    getHbMutexAttr<TARGETING::ATTR_I2C_PAGE_MUTEX_0>();
++                break;
++
++            case 1:
++                i_pageLock = i_target->
++                    getHbMutexAttr<TARGETING::ATTR_I2C_PAGE_MUTEX_1>();
++                break;
++
++            case 2:
++                i_pageLock = i_target->
++                    getHbMutexAttr<TARGETING::ATTR_I2C_PAGE_MUTEX_2>();
++                break;
++
++            default:
++                TRACFCOMP( g_trac_i2c,
++                        ERR_MRK"i2cGetPageMutex: Invalid engine for getting mutex!");
++                success = false;
++                assert(false, "i2c.C: Invalid engine for getting Mutex!"
++                        "i_args.engine=%d", i_args.engine );
++                break;
++
++        };
++
++    }while( 0 );
++    return success;
++}
++
+ 
+ // ------------------------------------------------------------------
+ // i2cWaitForCmdComp
+@@ -1326,6 +1737,7 @@ errlHndl_t i2cWaitForCmdComp ( TARGETING::Target * i_target,
+ 
+             if( err )
+             {
++                TRACFCOMP(g_trac_i2c, "Errored at i2cWaitForCmdComplete::i2cReadStatusReg");
+                 break;
+             }
+ 
+@@ -1720,6 +2132,9 @@ errlHndl_t i2cWaitForFifoSpace ( TARGETING::Target * i_target,
+ 
+         if( err )
+         {
++            TRACFCOMP( g_trac_i2c,
++                    "Errored out at i2cReadStatusReg: statusreg = %016llx",
++                    status.value);
+             break;
+         }
+ 
+diff --git a/src/usr/i2c/i2c.H b/src/usr/i2c/i2c.H
+index f4be4b8..9dfbeca 100755
+--- a/src/usr/i2c/i2c.H
++++ b/src/usr/i2c/i2c.H
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2011,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2011,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -51,6 +51,20 @@ enum i2c_reset_level
+     FORCE_UNLOCK_RESET,
+ };
+ 
++/**
++ * @brief Miscellaneous enums for I2C
++ */
++enum
++{
++    PAGE_ZERO = 0x0,
++    PAGE_ONE = 0x1,
++    PAGE_UNKNOWN = 0x2,
++    PAGE_ZERO_ADDR = 0x6C,
++    PAGE_ONE_ADDR  = 0x6E,
++    PAGE_OPERATION = 0xFF
++
++};
++
+ 
+ /**
+  * @brief FIFO size (width) in bytes.  This dictates how many bytes
+@@ -520,6 +534,59 @@ errlHndl_t fsi_i2cPerformOp( DeviceFW::OperationType i_opType,
+                          int64_t i_accessType,
+                          va_list i_args );
+ 
++
++/**
++ * @brief This function analyzes an error handle object and
++ *        performs an i2c reset if necessary
++ *
++ * @param[in] i_target - The target
++ * @param[in] i_err - There error to analyze
++ * @param[in] i_args - miscellaneous arguments
++ *
++ * @return void
++ */
++void i2cHandleError( TARGETING::Target * i_target,
++                     errlHndl_t & i_err,
++                     misc_args_t & i_args );
++
++
++
++/**
++ * @brief This function performs the necessary operations and comparisons
++ *        needed to decide what EEPROM page we are on and locks the appropriate
++ *        page control mutexes
++ * @param[in] i_opType - Operation Type - See DeviceFW::OperationType in
++ *                        driverif.H
++ * @param[in] i_target - The target to lock the page for.
++ * @param[in] i_accessType - Access Type - See DeviceFW::AccessType in
++ *                             userif.H
++ * @param[in] i_desiredPage - The EEPROM page that will be switched to.
++ * @param[in] i_lockMutex - bool that will decide whether or not we want to
++ *                      actually lock the associated mutex or not.
++ * @param[in] i_args - miscellaneous arguments
++ *
++ * @return errlHndl_t - NULL if successful, otherwise a pointer to an error log
++ *
++ */
++errlHndl_t i2cPageSwitchOp( DeviceFW::OperationType i_opType,
++                             TARGETING::Target * i_target,
++                             int64_t i_accessType,
++                             uint8_t i_desiredPage,
++                             bool i_lockMutex,
++                             misc_args_t & i_args );
++/**
++ * @brief This function unlocks the page mutex for targets given page attribute
++ *
++ * @param[in] i_target - target to unlock the page for.
++ * @param[in] i_args - miscellaneous arguments
++ *
++ * @return - True on success, False on failure.
++ */
++bool i2cPageUnlockOp( TARGETING::Target * i_target,
++                            misc_args_t & i_args );
++
++
++
+ /**
+  * @brief This function sets the Host vs FSI switches if the user has not
+  *  already.
+@@ -637,14 +704,15 @@ errlHndl_t i2cSetup ( TARGETING::Target * i_target,
+ 
+ 
+ /**
+- * @brief This function gets the appropriate engine mutex for a given target.
++ * @brief This function gets the appropriate engine
++ * mutex for a given target.
+  *
+  * @param[in] i_target - The target to get the mutex for.
+  *
+  * @param[in] i_args - Structure containing arguments needed to determine
+  *                     the correct engine mutex.
+  *
+- * @param[in/out] i_engineLock - The mutex.
++ * @param[in/out] i_engineLock - The engine mutex.
+  *
+  * @return bool - True if valid mutex is found, False otherwise.
+  */
+@@ -652,6 +720,24 @@ bool i2cGetEngineMutex( TARGETING::Target * i_target,
+                         misc_args_t & i_args,
+                         mutex_t *& i_engineLock );
+ 
++
++/**
++ * @brief This function gets the appropriate page mutex for the given i2c engine
++ *
++ * @param[in] i_target - The target to get the mutex for.
++ * @param[in] i_args - Structure containing arguments needed to determine
++ *                     the correct page mutex.
++ * @param[in/out] i_pageLock - The page mutex.
++ *
++ * @return bool - True if valid mutex is found, False otherwise.
++ */
++bool i2cGetPageMutex( TARGETING::Target * i_target,
++                      misc_args_t & i_args,
++                      mutex_t *& i_pageLock );
++
++
++
++
+ /**
+  * @brief This function will wait for the command to be complete or
+  *      timeout waiting before returning.
+diff --git a/src/usr/ipmi/ipmifruinv.C b/src/usr/ipmi/ipmifruinv.C
+index 152c72e..8c69f17 100644
+--- a/src/usr/ipmi/ipmifruinv.C
++++ b/src/usr/ipmi/ipmifruinv.C
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2014,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2014,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -474,7 +474,8 @@ errlHndl_t isdimmIpmiFruInv::addVpdData(std::vector<uint8_t> &io_data,
+         if (l_errl)
+         {
+             TRACFCOMP(g_trac_ipmi,"isdimmIpmiFruInv::addVpdData - "
+-                      "Error while reading SPD keyword size");
++                      "Error while reading SPD keyword size for keyword 0x%x",
++                      i_keyword);
+             break;
+         }
+ 
+diff --git a/src/usr/targeting/common/xmltohb/attribute_types_hb.xml b/src/usr/targeting/common/xmltohb/attribute_types_hb.xml
+index 76bea55..d49829d 100644
+--- a/src/usr/targeting/common/xmltohb/attribute_types_hb.xml
++++ b/src/usr/targeting/common/xmltohb/attribute_types_hb.xml
+@@ -115,6 +115,39 @@
+     <hbOnly/>
+ </attribute>
+ 
++<attribute>
++    <id>EEPROM_PAGE</id>
++    <description>
++        Used to keep track of what EEPROM page the current I2C master is set to
++    </description>
++    <simpleType>
++        <uint8_t>
++            <default>0</default>
++        </uint8_t>
++    </simpleType>
++    <persistency>volatile</persistency>
++    <readable/>
++    <writeable/>
++</attribute>
++
++<enumerationType>
++    <id>EEPROM_PAGE</id>
++    <description>Enumeration of EEPROM_PAGE</description>
++    <enumerator>
++        <name>ZERO</name>
++        <value>0</value>
++    </enumerator>
++    <enumerator>
++        <name>ONE</name>
++        <value>1</value>
++    </enumerator>
++    <enumerator>
++        <name>UNKNOWN</name>
++        <value>0xFF</value>
++    </enumerator>
++</enumerationType>
++
++
+ <!-- For POD Testing -->
+ <attribute>
+     <id>HB_MUTEX_TEST_LOCK</id>
+@@ -130,6 +163,48 @@
+ </attribute>
+ 
+ <attribute>
++    <id>I2C_PAGE_MUTEX_0</id>
++    <description>
++        Mutex to protect page select operations for I2C Master engine 0
++    </description>
++    <simpleType>
++        <hbmutex></hbmutex>
++    </simpleType>
++    <persistency>volatile-zeroed</persistency>
++    <readable/>
++    <writeable/>
++    <hbOnly/>
++</attribute>
++
++<attribute>
++    <id>I2C_PAGE_MUTEX_1</id>
++    <description> 
++        Mutex to protect page select operations for I2C Master engine 1
++    </description>
++    <simpleType>
++        <hbmutex></hbmutex>
++    </simpleType>
++    <persistency>volatile-zeroed</persistency>
++    <readable/>
++    <writeable/>
++    <hbOnly/>
++</attribute>
++
++<attribute>
++    <id>I2C_PAGE_MUTEX_2</id>
++    <description> 
++        Mutex to protect page select operations for I2C Master engine 2
++    </description>
++    <simpleType>
++        <hbmutex></hbmutex>
++    </simpleType>
++    <persistency>volatile-zeroed</persistency>
++    <readable/>
++    <writeable/>
++    <hbOnly/>
++</attribute>
++
++<attribute>
+     <id>I2C_ENGINE_MUTEX_0</id>
+     <description>Mutex for I2C Master engine 0</description>
+     <simpleType>
+diff --git a/src/usr/targeting/common/xmltohb/target_types_hb.xml b/src/usr/targeting/common/xmltohb/target_types_hb.xml
+index eb69105..3d01944 100644
+--- a/src/usr/targeting/common/xmltohb/target_types_hb.xml
++++ b/src/usr/targeting/common/xmltohb/target_types_hb.xml
+@@ -5,7 +5,7 @@
+ <!--                                                                        -->
+ <!-- OpenPOWER HostBoot Project                                             -->
+ <!--                                                                        -->
+-<!-- Contributors Listed Below - COPYRIGHT 2012,2015                        -->
++<!-- Contributors Listed Below - COPYRIGHT 2012,2016                        -->
+ <!-- [+] Google Inc.                                                        -->
+ <!-- [+] International Business Machines Corp.                              -->
+ <!--                                                                        -->
+@@ -185,6 +185,18 @@
+         <default>0</default>
+     </attribute>
+     <attribute>
++        <id>EEPROM_PAGE</id>
++        <default>0</default>
++    </attribute>
++    <attribute>
++        <id>I2C_PAGE_MUTEX_0</id>
++        <default>0</default>
++    </attribute>
++    <attribute>
++        <id>I2C_PAGE_MUTEX_1</id>
++        <default>0</default>
++    </attribute>
++    <attribute>
+         <id>GPIO_INFO</id>
+     </attribute>
+     <attribute><id>VPD_SWITCHES</id></attribute>
+diff --git a/src/usr/vpd/spd.C b/src/usr/vpd/spd.C
+index 6833e94..1e4993f 100644
+--- a/src/usr/vpd/spd.C
++++ b/src/usr/vpd/spd.C
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2013,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2013,2016                        */
+ /* [+] Google Inc.                                                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+@@ -258,8 +258,10 @@ errlHndl_t spdGetKeywordValue ( DeviceFW::OperationType i_opType,
+         else
+         {
+             TRACFCOMP( g_trac_spd,
+-                       ERR_MRK"Invalid Basic Memory Type (0x%04x)",
+-                       memType );
++                       ERR_MRK"Invalid Basic Memory Type (0x%04x), "
++                       "target huid = 0x%x",
++                       memType,
++                       TARGETING::get_huid(i_target));
+ 
+             /*@
+              * @errortype
+@@ -481,11 +483,14 @@ errlHndl_t spdFetchData ( uint64_t i_byteAddr,
+                                           i_byteAddr ) );
+             if( err )
+             {
++                TRACFCOMP(g_trac_spd,
++                        "ERROR: failing out of deviceOp in spd.C");
+                 break;
+             }
+         }
+         else
+         {
++            TRACFCOMP(g_trac_spd, "spdFetchData: vpd source incorrect!: %x", vpdSource);
+             configError = true;
+         }
+ 
+@@ -2039,18 +2044,29 @@ void setPartAndSerialNumberAttributes( TARGETING::Target * i_target )
+         }
+ 
+         // Get the keyword sizes
+-        size_t l_partDataSize = 0;
+-        size_t l_serialDataSize = 0;
+-        if( SPD_DDR3 == l_memType )
++        const KeywordData* entry = NULL;
++        l_err = getKeywordEntry( l_partKeyword,
++                                 l_memType,
++                                 i_target,
++                                 entry );
++        if( l_err )
+         {
+-            l_partDataSize = ddr3Data[l_partKeyword].length;
+-            l_serialDataSize = ddr3Data[l_serialKeyword].length;
++            break;
+         }
+-        else
++        size_t l_partDataSize = entry->length;
++
++        entry = NULL;
++        l_err = getKeywordEntry( l_serialKeyword,
++                                 l_memType,
++                                 i_target,
++                                 entry );
++        if( l_err )
+         {
+-            l_partDataSize = ddr4Data[l_partKeyword].length;
+-            l_serialDataSize = ddr4Data[l_serialKeyword].length;
++            break;
+         }
++        size_t l_serialDataSize = entry->length;
++        TRACDCOMP(g_trac_spd,"l_partDataSize=%d,l_serialDataSize=%d\n",
++                l_partDataSize,l_serialDataSize);
+ 
+         //read the keywords from SEEPROM since PNOR may not be loaded yet
+         uint8_t l_partNumberData[l_partDataSize];
+@@ -2079,7 +2095,7 @@ void setPartAndSerialNumberAttributes( TARGETING::Target * i_target )
+ 
+         if( l_err )
+         {
+-            TRACDCOMP(g_trac_spd, ERR_MRK"spd.C::setPartAndSerialNumberAttributes(): Error after spdGetValue-> SERIAL_NUMBER");
++            TRACFCOMP(g_trac_spd, ERR_MRK"spd.C::setPartAndSerialNumberAttributes(): Error after spdGetValue-> SERIAL_NUMBER");
+             errlCommit(l_err, VPD_COMP_ID);
+             l_err = NULL;
+             break;
+@@ -2091,8 +2107,9 @@ void setPartAndSerialNumberAttributes( TARGETING::Target * i_target )
+         size_t expectedSNSize = sizeof(l_SN);
+         if(expectedPNSize < l_partDataSize)
+         {
+-            TRACFCOMP(g_trac_spd, "Part data size too large for attribute. Expected: %d Actual: %d",
+-                        expectedPNSize, l_partDataSize);
++            TRACFCOMP(g_trac_spd, "Part data size too large for attribute. Expected: %d Actual: %d"
++                    "Keyword: %X",
++                    expectedPNSize, l_partDataSize, l_partKeyword);
+         }
+         else
+         {
+@@ -2143,16 +2160,18 @@ errlHndl_t cmpPnorToSeeprom ( TARGETING::Target * i_target,
+             break;
+         }
+ 
+-        // Get the keyword size
+-        size_t dataSize = 0;
+-        if( SPD_DDR3 == memType )
+-        {
+-            dataSize = ddr3Data[i_keyword].length;
+-        }
+-        else
++         // Get the keyword size
++        const KeywordData* entry = NULL;
++        err = getKeywordEntry( i_keyword,
++                                 memType,
++                                 i_target,
++                                 entry );
++        if( err )
+         {
+-            dataSize = ddr4Data[i_keyword].length;
++            break;
+         }
++        size_t dataSize = entry->length;
++
+ 
+         // Read the keyword from PNOR
+         size_t sizePnor = dataSize;
+@@ -2212,7 +2231,7 @@ errlHndl_t loadPnor ( TARGETING::Target * i_target )
+ {
+     errlHndl_t err = NULL;
+ 
+-    TRACSSCOMP( g_trac_spd, ENTER_MRK"loadPnorCache()" );
++    TRACFCOMP( g_trac_spd, ENTER_MRK"loadPnor()" );
+ 
+     do
+     {
+@@ -2227,11 +2246,17 @@ errlHndl_t loadPnor ( TARGETING::Target * i_target )
+ 
+         // Load PNOR cache from SEEPROM
+ 
+-        // Read the entire SPD section from SEEPROM
+-        uint8_t writeData[DIMM_SPD_SECTION_SIZE];
++        //TODO Read entire EEPROM at one time - requires code to recognize
++        //     that a read request straddles the boundary between EEPROM
++        //     pages zero and one.
++
++        // Read the first half SPD section from SEEPROM
++        size_t writeDataSize = 0;
++        size_t halfSpdSectionSize = DIMM_SPD_SECTION_SIZE/2;
++        uint8_t spdEepromData[DIMM_SPD_SECTION_SIZE];
+         err = spdFetchData ( 0x0,
+-                             DIMM_SPD_SECTION_SIZE,
+-                             writeData,
++                             halfSpdSectionSize,
++                             spdEepromData,
+                              i_target,
+                              VPD::SEEPROM );
+         if( err )
+@@ -2240,22 +2265,65 @@ errlHndl_t loadPnor ( TARGETING::Target * i_target )
+                 ERR_MRK"loadPnorCache: Error reading SEEPROM SPD data" );
+             break;
+         }
++        TRACFBIN(g_trac_spd, "FirstEepromPage: ", spdEepromData, 256);
++
++        // Determine the memory type so we know if we need to read another 256
++        // bytes from the eeprom.
++        uint8_t memType = 0x0;
++        err = getMemType( memType,
++                          i_target,
++                          VPD::SEEPROM );
++
++        if( err )
++        {
++            TRACFCOMP(g_trac_spd,
++                    "spd.C::loadPnor - Error getting memtype(0x%x) "
++                    "for target = 0x%x",
++                    memType,
++                    TARGETING::get_huid(i_target));
++            break;
++        }
++
++        // If DDR3, write 256 bytes, else write 512 bytes
++        if( memType == SPD_DDR3 )
++        {
++            writeDataSize = halfSpdSectionSize;
++        }
++        else
++        {
++            writeDataSize = DIMM_SPD_SECTION_SIZE;
++            err = spdFetchData ( 0x100,
++                                 halfSpdSectionSize,
++                                 &spdEepromData[256],
++                                 i_target,
++                                 VPD::SEEPROM );
++            if( err )
++            {
++                TRACFCOMP( g_trac_spd,
++                    ERR_MRK"loadPnorCache: Error reading SEEPROM SPD data" );
++                break;
++            }
++            TRACFBIN(g_trac_spd, "SecondEepromPage: ", &spdEepromData[256], 256);
++        }
++
+ 
+         // Write the entire SPD section to PNOR
++        TRACFBIN(g_trac_spd, "ENTIRE EEPROM", spdEepromData, writeDataSize);
+         err = spdWriteData( 0x0,
+-                            DIMM_SPD_SECTION_SIZE,
+-                            writeData,
++                            writeDataSize,
++                            spdEepromData,
+                             i_target,
+                             VPD::PNOR );
+         if( err )
+         {
+-            TRACFCOMP( g_trac_spd,ERR_MRK"loadPnorCache: Error writing PNOR SPD data" );
++            TRACFCOMP( g_trac_spd,ERR_MRK"loadPnorCache: Error writing PNOR SPD data 2" );
+             break;
+         }
+ 
++
+     } while(0);
+ 
+-    TRACSSCOMP( g_trac_spd, EXIT_MRK"loadPnorCache()" );
++    TRACFCOMP( g_trac_spd, EXIT_MRK"loadPnorCache()" );
+ 
+     return err;
+ }
+diff --git a/src/usr/vpd/spdDDR4.H b/src/usr/vpd/spdDDR4.H
+index a3df6f3..d263f9c 100755
+--- a/src/usr/vpd/spdDDR4.H
++++ b/src/usr/vpd/spdDDR4.H
+@@ -5,7 +5,7 @@
+ /*                                                                        */
+ /* OpenPOWER HostBoot Project                                             */
+ /*                                                                        */
+-/* Contributors Listed Below - COPYRIGHT 2013,2015                        */
++/* Contributors Listed Below - COPYRIGHT 2013,2016                        */
+ /* [+] International Business Machines Corp.                              */
+ /*                                                                        */
+ /*                                                                        */
+@@ -112,6 +112,7 @@ const KeywordData ddr4Data[] =
+     { DRAM_MANUFACTURER_ID,             0x15f,  0x02,   0x00,   0x00, true,  false, NA },
+     { MANUFACTURER_SPECIFIC_DATA,       0x161,  0x1d,   0x00,   0x00, false, false, NA },
+     { DIMM_BAD_DQ_DATA,                 0x180,  0x50,   0x00,   0x00, false, true,  NA },
++    { MODULE_REVISION_CODE,             0x15d,  0x01,   0x00,   0x00, false, false, NA },
+     // Normal fields supported on DDR4 only
+     { BANK_GROUP_BITS,                  0x04,   0x01,   0xC0,   0x06, false, false, NA },
+     { BANK_ADDRESS_BITS_DDR4,           0x04,   0x01,   0x30,   0x04, false, false, NA },
+@@ -132,7 +133,6 @@ const KeywordData ddr4Data[] =
+     { TRRDS_FINE_OFFSET,                0x77,   0x01,   0x00,   0x00, false, false, NA },
+     { TCKMAX_FINE_OFFSET,               0x7c,   0x01,   0x00,   0x00, false, false, NA },
+     { BASE_CONFIG_CRC,                  0x7f,   0x02,   0x00,   0x00, true,  false, NA },
+-    { MODULE_REVISION_CODE_DDR4,        0x15d,  0x01,   0x00,   0x00, false, false, NA },
+     { DRAM_STEPPING,                    0x160,  0x01,   0x00,   0x00, false, false, NA },
+     { MANUFACTURING_SECTION_CRC,        0x17f,  0x02,   0x00,   0x00, true,  false, NA },
+     // Module Specific fields supported on both DDR3 and DDR4
+-- 
+1.8.2.2
+

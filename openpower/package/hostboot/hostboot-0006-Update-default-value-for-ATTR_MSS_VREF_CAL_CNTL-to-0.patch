@@ -1,0 +1,26 @@
+From 8ad12a19661fbcd4ccbe9c3def2300dbb885b19d Mon Sep 17 00:00:00 2001
+From: aalugore <aalugore@us.ibm.com>
+Date: Wed, 3 Feb 2016 15:58:23 -0600
+Subject: [PATCH 2/2] Update default value for ATTR_MSS_VREF_CAL_CNTL to 0x00
+
+Change-Id: I546496dda6ecbcbb92c7e648a5dbc837eed041f1
+---
+ src/usr/targeting/common/xmltohb/attribute_types.xml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/usr/targeting/common/xmltohb/attribute_types.xml b/src/usr/targeting/common/xmltohb/attribute_types.xml
+index fb60c5a..784c6f6 100644
+--- a/src/usr/targeting/common/xmltohb/attribute_types.xml
++++ b/src/usr/targeting/common/xmltohb/attribute_types.xml
+@@ -15923,7 +15923,7 @@ firmware notes: Platforms should initialize this attribute to AUTO (0)</descript
+     </description>
+     <simpleType>
+         <uint8_t>
+-            <default>0x01</default>
++            <default>0x00</default>
+         </uint8_t>
+     </simpleType>
+     <persistency>volatile</persistency>
+-- 
+1.8.2.2
+

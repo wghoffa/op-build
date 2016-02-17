@@ -1,0 +1,49 @@
+From f291539d9b7157536b63c21bd5e0cbf3e7e5e1c9 Mon Sep 17 00:00:00 2001
+From: Bill Hoffa <wghoffa@us.ibm.com>
+Date: Tue, 23 Feb 2016 07:42:10 -0600
+Subject: [PATCH] Change eepromReadData() Trace Level
+
+Change-Id: I0ebce4e8bd9e0243f9968b22e35fa01a553a512c
+---
+ src/usr/i2c/eepromdd.C | 2 +-
+ src/usr/vpd/spd.C      | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/usr/i2c/eepromdd.C b/src/usr/i2c/eepromdd.C
+index c775137..1ebc94b 100755
+--- a/src/usr/i2c/eepromdd.C
++++ b/src/usr/i2c/eepromdd.C
+@@ -846,7 +846,7 @@ errlHndl_t eepromReadData( TARGETING::Target * i_target,
+ 
+     }while( 0 );
+ 
+-    TRACFCOMP(g_trac_eeprom,
++    TRACUCOMP(g_trac_eeprom,
+             EXIT_MRK"eepromReadData");
+     return l_err;
+ }
+diff --git a/src/usr/vpd/spd.C b/src/usr/vpd/spd.C
+index 1e4993f..bf8f3f4 100644
+--- a/src/usr/vpd/spd.C
++++ b/src/usr/vpd/spd.C
+@@ -2265,7 +2265,7 @@ errlHndl_t loadPnor ( TARGETING::Target * i_target )
+                 ERR_MRK"loadPnorCache: Error reading SEEPROM SPD data" );
+             break;
+         }
+-        TRACFBIN(g_trac_spd, "FirstEepromPage: ", spdEepromData, 256);
++        TRACDBIN(g_trac_spd, "FirstEepromPage: ", spdEepromData, 256);
+ 
+         // Determine the memory type so we know if we need to read another 256
+         // bytes from the eeprom.
+@@ -2303,7 +2303,7 @@ errlHndl_t loadPnor ( TARGETING::Target * i_target )
+                     ERR_MRK"loadPnorCache: Error reading SEEPROM SPD data" );
+                 break;
+             }
+-            TRACFBIN(g_trac_spd, "SecondEepromPage: ", &spdEepromData[256], 256);
++            TRACDBIN(g_trac_spd, "SecondEepromPage: ", &spdEepromData[256], 256);
+         }
+ 
+ 
+-- 
+1.8.2.2
+
