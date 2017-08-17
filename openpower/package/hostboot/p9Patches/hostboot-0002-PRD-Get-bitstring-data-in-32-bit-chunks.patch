@@ -1,0 +1,73 @@
+From 51798ca7fa10c85acbc0e261ef14e7212b3ec036 Mon Sep 17 00:00:00 2001
+From: Benjamin Weisenbeck <bweisenb@us.ibm.com>
+Date: Tue, 15 Aug 2017 14:52:29 -0500
+Subject: [PATCH 2/2] PRD: Get bitstring data in 32 bit chunks
+
+Change-Id: Id4c91013bdda38ccb9da944c8da914010d23c19f
+CQ: SW398985
+Reviewed-on: http://ralgit01.raleigh.ibm.com/gerrit1/44642
+Tested-by: Jenkins Server <pfd-jenkins+hostboot@us.ibm.com>
+Reviewed-by: Brian J. Stegmiller <bjs@us.ibm.com>
+Reviewed-by: Caleb N. Palmer <cnpalmer@us.ibm.com>
+Reviewed-by: Zane C. Shelley <zshelle@us.ibm.com>
+---
+ .../prdf/common/framework/register/prdfHomRegisterAccess.C   |  6 +++++-
+ src/usr/diag/prdf/plat/prdfPlatServices_rt.C                 | 12 ++++++++----
+ 2 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/usr/diag/prdf/common/framework/register/prdfHomRegisterAccess.C b/src/usr/diag/prdf/common/framework/register/prdfHomRegisterAccess.C
+index 3452869..a9d2a61 100755
+--- a/src/usr/diag/prdf/common/framework/register/prdfHomRegisterAccess.C
++++ b/src/usr/diag/prdf/common/framework/register/prdfHomRegisterAccess.C
+@@ -175,11 +175,15 @@ uint32_t ScomAccessor::Access(TargetHandle_t i_target,
+                                 P9_STOP_SECTION_CORE_SCOM :
+                                 P9_STOP_SECTION_EQ_SCOM;
+ 
++                            uint64_t scomVal =
++                                (((uint64_t)bs.getFieldJustify(0, 32)) << 32) |
++                                 ((uint64_t)bs.getFieldJustify(32, 32));
++
+                             err = RTPM::hcode_update(sec,
+                                                      P9_STOP_SCOM_OR_APPEND,
+                                                      i_target,
+                                                      registerId,
+-                                                     bs.getFieldJustify(0,64));
++                                                     scomVal);
+                             if( nullptr != err)
+                             {
+                                 PRDF_ERR("[ScomAccessor::Access()] Error in"
+diff --git a/src/usr/diag/prdf/plat/prdfPlatServices_rt.C b/src/usr/diag/prdf/plat/prdfPlatServices_rt.C
+index c992ee1..a53a361 100644
+--- a/src/usr/diag/prdf/plat/prdfPlatServices_rt.C
++++ b/src/usr/diag/prdf/plat/prdfPlatServices_rt.C
+@@ -400,9 +400,11 @@ int32_t l3LineDelete(TargetHandle_t i_exTgt,
+     ldData.setFieldJustify(12, 5, i_l3_err_data.member);
+     ldData.setFieldJustify(17, 12, i_l3_err_data.hashed_real_address_45_56);
+ 
++    uint64_t scomVal = (((uint64_t)ldData.getFieldJustify(0, 32)) << 32) |
++                        ((uint64_t)ldData.getFieldJustify(32, 32));
++
+     err = RTPM::hcode_update(P9_STOP_SECTION_L3, P9_STOP_SCOM_APPEND,
+-                             i_exTgt, 0x1001180E,
+-                             ldData.getFieldJustify(0, 64));
++                             i_exTgt, 0x1001180E, scomVal);
+     if (nullptr != err)
+     {
+         PRDF_ERR( "[PlatServices::l3LineDelete] HUID: 0x%08x hcode_update "
+@@ -502,9 +504,11 @@ int32_t l2LineDelete(TargetHandle_t i_exTgt,
+     if (i_l2_err_data.bank)
+         ldData.setBit(28);
+ 
++    uint64_t scomVal = (((uint64_t)ldData.getFieldJustify(0, 32)) << 32) |
++                        ((uint64_t)ldData.getFieldJustify(32, 32));
++
+     err = RTPM::hcode_update(P9_STOP_SECTION_L2, P9_STOP_SCOM_APPEND,
+-                             i_exTgt, 0x1001080E,
+-                             ldData.getFieldJustify(0, 64));
++                             i_exTgt, 0x1001080E, scomVal);
+     if (nullptr != err)
+     {
+         PRDF_ERR( "[PlatServices::l2LineDelete] HUID: 0x%08x hcode_update "
+-- 
+1.8.3.1
+

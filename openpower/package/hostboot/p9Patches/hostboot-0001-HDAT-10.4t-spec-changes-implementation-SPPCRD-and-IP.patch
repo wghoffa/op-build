@@ -1,0 +1,169 @@
+From 018a4ada99dd9e988b697c8f03da34329739139a Mon Sep 17 00:00:00 2001
+From: nagurram-in <nagendra.g@in.ibm.com>
+Date: Mon, 7 Aug 2017 01:48:29 -0500
+Subject: [PATCH 1/2] HDAT 10.4t spec changes implementation ( SPPCRD and IPMI
+ changes)
+
+Change-Id: I11cf63498ca4d5a5a269bbc969f70fed4e655a5b
+---
+ src/usr/hdat/hdatipmi.C | 21 +++++++++++++++++----
+ src/usr/hdat/hdatipmi.H |  3 ++-
+ src/usr/hdat/hdatpcrd.C | 23 +++++++++++++++++------
+ src/usr/hdat/hdatpcrd.H | 11 ++++++++---
+ 4 files changed, 44 insertions(+), 14 deletions(-)
+
+diff --git a/src/usr/hdat/hdatipmi.C b/src/usr/hdat/hdatipmi.C
+index 9ee5088..e4721be 100644
+--- a/src/usr/hdat/hdatipmi.C
++++ b/src/usr/hdat/hdatipmi.C
+@@ -78,26 +78,39 @@ HdatIpmi::HdatIpmi(errlHndl_t &o_errlHndl, const hdatMsAddr_t &i_msAddr):
+         TARGETING::PredicateCTM l_dimmFilter(TARGETING::CLASS_LOGICAL_CARD,
+                                              TARGETING::TYPE_DIMM);
+ 
++        TARGETING::PredicateCTM l_occFilter(TARGETING::CLASS_UNIT,
++                                             TARGETING::TYPE_OCC);
++
+         TARGETING::PredicatePostfixExpr l_presentTargExpr;
+         l_presentTargExpr.push(&l_procFilter).push(&l_sysFilter).Or().
+                      push(&l_nodeFilter).Or().push(&l_dimmFilter).Or().
+-                     push(&l_predHwas).And();
++                     push(&l_occFilter).Or().push(&l_predHwas).And();
+ 
+         TARGETING::TargetRangeFilter l_targFilter(
+         l_targetService.begin(),
+         l_targetService.end(),
+         &l_presentTargExpr);
+         
+-        TARGETING::ATTR_IPMI_SENSORS_type sensors = {{0}};
+         for(; l_targFilter; ++l_targFilter)
+         {
+             // Create a new array entry and push it to FRU/LED sensor vector
++            TARGETING::ATTR_IPMI_SENSORS_type sensors = {{0}};
+             hdatIPMIFRUSensorMapEntry_t l_fruEntry;
+-            l_fruEntry.SLCAIndex = (*l_targFilter)->getAttr<ATTR_SLCA_INDEX>();
+-            assert((*l_targFilter)->tryGetAttr<TARGETING::ATTR_IPMI_SENSORS>(sensors));
++            if((*l_targFilter)->getAttr<ATTR_CLASS>() == TARGETING::CLASS_UNIT)
++            {
++                const TARGETING::Target *l_parentTarget = getParentChip(*l_targFilter); 
++                l_fruEntry.SLCAIndex = (l_parentTarget)->getAttr<ATTR_SLCA_INDEX>();
++            }
++            else
++            {
++                l_fruEntry.SLCAIndex = (*l_targFilter)->getAttr<ATTR_SLCA_INDEX>();
++            }
++            (*l_targFilter)->tryGetAttr<TARGETING::ATTR_IPMI_SENSORS>(sensors);
++
+             for(auto & l_sensor : sensors)
+             {
+                 l_fruEntry.IPMISensorID = l_sensor[1];
++                l_fruEntry.IPMIEntityID = (uint8_t)(l_sensor[0] & 0x00FF);
+                 l_fruEntry.IPMISensorType = (uint8_t)(l_sensor[0] >> 8);
+                 // OPAL doesn't like sensor types of 0xFF, so filter them out.
+                 if( l_fruEntry.IPMISensorType != 0xFF )
+diff --git a/src/usr/hdat/hdatipmi.H b/src/usr/hdat/hdatipmi.H
+index f164761..43e8770 100644
+--- a/src/usr/hdat/hdatipmi.H
++++ b/src/usr/hdat/hdatipmi.H
+@@ -72,7 +72,8 @@ struct hdatIPMIFRUSensorMapEntry_t
+     uint32_t SLCAIndex;
+     uint8_t  IPMISensorType;
+     uint8_t  IPMISensorID;
+-    uint16_t Reserved;
++    uint8_t  IPMIEntityID;
++    uint8_t Reserved;
+ }__attribute__ ((packed));
+ 
+ struct hdatIPMILEDSensorMapEntry_t
+diff --git a/src/usr/hdat/hdatpcrd.C b/src/usr/hdat/hdatpcrd.C
+index 1ecda25..4033e32 100644
+--- a/src/usr/hdat/hdatpcrd.C
++++ b/src/usr/hdat/hdatpcrd.C
+@@ -657,16 +657,25 @@ errlHndl_t HdatPcrd::hdatSetProcessorInfo(
+ 
+         }
+ 
+-        uint32_t l_procFabricId =
++        uint32_t l_procRealFabricGrpId =
+                     i_pProcTarget->getAttr<TARGETING::ATTR_FABRIC_GROUP_ID>();
+ 
+-        // Set fabric nodeid (NNN) and chip (CC) into xscom id:  NN_N0CC
+-        uint32_t l_XscomChipId =
++        // Set fabric Groupid (NNN) and chip (CC) into Real fabric grp ID
++        uint32_t l_RealFabricChipId =
+                     i_pProcTarget->getAttr<TARGETING::ATTR_FABRIC_CHIP_ID>();
+-        l_XscomChipId |= l_procFabricId << 3;
+ 
++        iv_spPcrd->hdatChipData.hdatPcrdRealFabricGrpId = 
++                        (l_RealFabricChipId | (l_procRealFabricGrpId << 3));
+ 
+-        iv_spPcrd->hdatChipData.hdatPcrdXscomChipId = l_XscomChipId;
++        uint32_t l_procEffFabricGrpId =
++                    i_pProcTarget->getAttr<TARGETING::ATTR_PROC_EFF_FABRIC_GROUP_ID>();
++
++        // Set Effective fabric Groupid (NNN) and chip (CC) into Effective fabric grp ID
++        uint32_t l_EffFabricChipId =
++                    i_pProcTarget->getAttr<TARGETING::ATTR_PROC_EFF_FABRIC_CHIP_ID>();
++
++        iv_spPcrd->hdatChipData.hdatPcrdEffFabricGrpId = 
++                        (l_EffFabricChipId | (l_procEffFabricGrpId << 3));
+ 
+ 
+         TARGETING::TargetHandleList targetListNode;
+@@ -738,7 +747,7 @@ errlHndl_t HdatPcrd::hdatSetProcessorInfo(
+         HDAT_DBG("hw card ID:0x%llx", l_HWCardId);
+ 
+         iv_spPcrd->hdatChipData.hdatPcrdHwCardID = l_HWCardId;
+-        iv_spPcrd->hdatChipData.hdatPcrdFabricId = l_procFabricId;
++        iv_spPcrd->hdatChipData.hdatPcrdFabricId = l_procRealFabricGrpId;
+         iv_spPcrd->hdatChipData.hdatPcrdCcmNodeID =
+                     l_pNodeTarget->getAttr<TARGETING::ATTR_ORDINAL_ID>();
+ 
+@@ -777,6 +786,8 @@ errlHndl_t HdatPcrd::hdatSetProcessorInfo(
+ 
+         iv_spPcrd->hdatChipData.hdatPcrdStopLevelSupport =
+             l_pSysTarget->getAttr<TARGETING::ATTR_SUPPORTED_STOP_STATES>();
++        iv_spPcrd->hdatChipData.hdatPcrdCheckstopAddr = HDAT_SW_CHKSTP_FIR_SCOM;
++        iv_spPcrd->hdatChipData.hdatPcrdSpareBitNum   = HDAT_SW_CHKSTP_FIR_SCOM_BIT_POS;
+ 
+     }
+     while(0);
+diff --git a/src/usr/hdat/hdatpcrd.H b/src/usr/hdat/hdatpcrd.H
+index 421c7c5..3d5ef0b 100644
+--- a/src/usr/hdat/hdatpcrd.H
++++ b/src/usr/hdat/hdatpcrd.H
+@@ -53,8 +53,10 @@ namespace HDAT
+ 
+ #define HDAT_NUM_P7_PCRD_ENTRIES    32
+ #define HDAT_FULL_MVPD_SIZE 0x10000
+-const uint16_t HDAT_PCRD_VERSION    = 0x20;
++const uint16_t HDAT_PCRD_VERSION    = 0x21;
+ const char HDAT_PCRD_STRUCT_NAME[7] = "SPPCRD";
++#define HDAT_SW_CHKSTP_FIR_SCOM         0x05012000
++#define HDAT_SW_CHKSTP_FIR_SCOM_BIT_POS 0x1F  
+ 
+ //Max number of I2c devices for any given proc
+ #define HDAT_PCRD_MAX_I2C_DEV  64
+@@ -89,8 +91,8 @@ struct hdatPcrdChipInfo_t
+     uint32_t  hdatPcrdStatusFlags;      // 0x0004 verify/exist flags
+     uint32_t  hdatPcrdNxFunctional;     // 0x0008 NX functional
+     uint32_t  hdatPcrdPoreFunctional;   // 0x000C Pore functional
+-    uint32_t  hdatPcrdXscomChipId;      // 0x0010 XSCOM chip ID
+-    uint32_t  reserved_01;              // 0x0014 ECO Cores
++    uint32_t  hdatPcrdRealFabricGrpId;  // 0x0010 Real Fabric Group ID
++    uint32_t  hdatPcrdEffFabricGrpId;   // 0x0014 Effective Fabric Group ID
+     uint32_t  hdatPcrdDbobId;           // 0x0018 Drawer/Book/Octant/Blade ID
+                                         //          (DBOB)
+     uint32_t  hdatPcrdOccFuncState;     // 0x001C OCC Functional State
+@@ -104,6 +106,9 @@ struct hdatPcrdChipInfo_t
+     uint32_t  hdatPcrdCappFunc_unit0;   // 0x0038 Capp functional state unit0
+     uint32_t  hdatPcrdCappFunc_unit1;   // 0x003C Capp functional state unit1
+     uint32_t  hdatPcrdStopLevelSupport; // 0x0040 Supported Stop Level
++    uint32_t  hdatPcrdCheckstopAddr;    // 0x0044 SW Checkstop FIR SCom address
++    uint8_t   hdatPcrdSpareBitNum;      // 0x0048 Bit position to set for FIR scom
++    uint8_t   reserved_02[3];           // 0x0049 Reserved 
+ } __attribute__ ((packed));
+ 
+ /* @brief Defines 'chip time-of-day structure in the PCRD */
+-- 
+1.8.3.1
+
