@@ -1,0 +1,41 @@
+From fb1be42f9f4ec9b48dfbeb45db94efb73476349e Mon Sep 17 00:00:00 2001
+From: Prasad Bg Ranganath <prasadbgr@in.ibm.com>
+Date: Thu, 14 Sep 2017 02:55:20 -0500
+Subject: [PATCH] PM: remove bad VDM check exit in pstate parameter block
+
+Change-Id: Ie49d6407738f0b6ddd7d493b3ad1972f937c23ce
+CQ:SW401983
+Reviewed-on: http://ralgit01.raleigh.ibm.com/gerrit1/46186
+Tested-by: Hostboot CI <hostboot-ci+hostboot@us.ibm.com>
+Tested-by: FSP CI Jenkins <fsp-CI-jenkins+hostboot@us.ibm.com>
+Tested-by: Jenkins Server <pfd-jenkins+hostboot@us.ibm.com>
+Reviewed-by: Juan R. Medina <jrmedina@us.ibm.com>
+Reviewed-by: Gregory S. Still <stillgs@us.ibm.com>
+Reviewed-by: Jennifer A. Stofer <stofer@us.ibm.com>
+---
+ .../chips/p9/procedures/hwp/pm/p9_pstate_parameter_block.C       | 9 ---------
+ 1 file changed, 9 deletions(-)
+
+diff --git a/src/import/chips/p9/procedures/hwp/pm/p9_pstate_parameter_block.C b/src/import/chips/p9/procedures/hwp/pm/p9_pstate_parameter_block.C
+index 474c507..8b485b2 100644
+--- a/src/import/chips/p9/procedures/hwp/pm/p9_pstate_parameter_block.C
++++ b/src/import/chips/p9/procedures/hwp/pm/p9_pstate_parameter_block.C
+@@ -3216,15 +3216,6 @@ proc_get_mvpd_poundw(const fapi2::Target<fapi2::TARGET_TYPE_PROC_CHIP>& i_target
+             }
+         }
+ 
+-        // The rest of the processing here is all checking of the VDM content
+-        // within #W.  If VDMs are not enabled (or supported), skip all of it
+-        if (!is_vdm_enabled(o_state))
+-        {
+-            FAPI_INF("   proc_get_mvpd_poundw: VDM is disabled.  Skipping remaining checks");
+-            o_state->iv_vdm_enabled = false;
+-            break;
+-        }
+-
+         uint8_t l_poundw_static_data = 0;
+         const fapi2::Target<fapi2::TARGET_TYPE_SYSTEM> FAPI_SYSTEM;
+         FAPI_TRY(FAPI_ATTR_GET(fapi2::ATTR_POUND_W_STATIC_DATA_ENABLE,
+-- 
+1.8.2.2
+
